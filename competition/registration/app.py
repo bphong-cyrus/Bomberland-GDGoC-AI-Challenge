@@ -31,17 +31,6 @@ def create_app() -> Flask:
     credentials_file = os.getenv("LEADERBOARD_CREDENTIALS_FILE", os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "secrets/service_account_credentials.json"))
     storage_dir = os.getenv("SUBMISSION_STORAGE_DIR", "submissions")
 
-    # Initialize Google Drive service for submission downloads
-    drive_service = None
-    if os.path.exists(credentials_file):
-        try:
-            creds = service_account.Credentials.from_service_account_file(
-                credentials_file,
-                scopes=["https://www.googleapis.com/auth/drive.readonly"],
-            )
-            drive_service = build("drive", "v3", credentials=creds)
-        except Exception as e:
-            print(f"Warning: Could not initialize Google Drive service: {e}")
 
     @app.post("/register")
     def register_team():
@@ -111,6 +100,18 @@ def create_app() -> Flask:
                 ),
                 400,
             )
+
+        # isolate drive_service
+        drive_service = None
+        if os.path.exists(credentials_file):
+            try:
+                creds = service_account.Credentials.from_service_account_file(
+                    credentials_file,
+                    scopes=["https://www.googleapis.com/auth/drive.readonly"],
+                )
+                drive_service = build("drive", "v3", credentials=creds)
+            except Exception as e:
+                print(f"Warning: Could not initialize Google Drive service: {e}")
 
         if drive_service is None:
             return (

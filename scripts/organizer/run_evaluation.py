@@ -426,6 +426,7 @@ def run_submission_batch(
                 match_durations.append(float(job_result.get("duration_s", 0.0)))
                 if not job_result.get("ok"):
                     fail_count += 1
+                    logger.error(f"Match failed: {job_result.get('error')}")
                     continue
 
                 # If worker didn't successfully upload artifacts (common when workers lack
@@ -652,6 +653,7 @@ def run_background_cycle(
             for future in concurrent.futures.as_completed(futures):
                 job_result = future.result()
                 if not job_result.get("ok"):
+                    logger.error(f"Match failed: {job_result.get('error')}")
                     continue
                 ranking.update_ratings(
                     submission_ids=job_result["submission_ids"],

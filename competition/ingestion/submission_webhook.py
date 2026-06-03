@@ -146,6 +146,13 @@ def process_submission_webhook(
     
     if not ok:
         # Collector will have already saved the invalid submission record to DB
+        try:
+            update_google_sheets(
+                db_path=store.db_path,
+                spreadsheet_id=os.getenv("LEADERBOARD_SPREADSHEET_ID"),
+            )
+        except Exception as e:
+            print(f"Warning: Could not record validation failure to Sheet: {e}")
         return False, {"error": "validation_failed", "reason": note}
     
     # Step 4: Increment daily quota counter
