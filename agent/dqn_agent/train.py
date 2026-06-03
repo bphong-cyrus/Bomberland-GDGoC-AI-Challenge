@@ -207,6 +207,7 @@ def run_episode(env, seed, q_net, learner_seats, opponents, epsilon, gamma, n_st
     prev_alive = [bool(env.players[i].alive) for i in range(n)]
     death_order = []
     enc = {s: encode_obs(obs, s) for s in learner_seats}
+    dev = next(q_net.parameters()).device
 
     while True:
         actions = [0] * n
@@ -217,8 +218,8 @@ def run_episode(env, seed, q_net, learner_seats, opponents, epsilon, gamma, n_st
                 else:
                     ms, xs = enc[s]
                     with torch.no_grad():
-                        q = q_net(torch.from_numpy(ms).unsqueeze(0),
-                                  torch.from_numpy(xs).unsqueeze(0))[0].numpy()
+                        q = q_net(torch.from_numpy(ms).unsqueeze(0).to(dev),
+                                  torch.from_numpy(xs).unsqueeze(0).to(dev))[0].cpu().numpy()
                     actions[s] = safe_action(obs, s, q)
         for seat, pol in opponents.items():
             if env.players[seat].alive:
