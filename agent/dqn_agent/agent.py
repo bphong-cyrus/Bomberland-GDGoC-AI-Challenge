@@ -1,3 +1,8 @@
+"""
+GDGoC-HCMUS AI Challenge 2026 — Bomberland DQN Agent
+4-player (13×13 grid) | CPU inference <100ms | Double DQN + TorchScript
+Flat submission: agent.py + model.pt (or model.pth) in same directory.
+"""
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -8,515 +13,522 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+# ── Game constants ─────────────────────────────────────────────────────────────
+BOMB_TIMER_MAX  = 7
+BOMB_RADIUS_MAX = 5
+BOMB_CAP_MAX    = 5
+NUM_ACTIONS     = 6   # 0=STOP 1=LEFT 2=RIGHT 3=UP 4=DOWN 5=PLACE_BOMB
 
-# Constants from engine
-class Map:
-    GRASS = 0
-    WALL = 1
-    BOX = 2
-    ITEM_RADIUS = 3
-    ITEM_CAPACITY = 4
-    BOMB = 5
+# State encoding dimensions (change these only if you change encode_obs)
+N_MAP_CH = 10   # terrain×5, my_pos, enemy_pos(merged), bomb_timer, my_bomb, foe_bomb
+N_AUX    = 3    # bombs_left/max, radius/max, enemies_alive_ratio
 
-class Player:
-    MAX_BOMB_RADIUS = 5
-    MAX_BOMB_CAPACITY = 5
 
-BOMB_MAX_TIMER = 7
+# ── State encoder ──────────────────────────────────────────────────────────────
+def encode_obs(obs: dict, agent_id: int):
+    """
+    Encode a 4-player (or 2-player) observation into tensors.
 
+    Returns
+    -------
+    map_feat : np.ndarray, float32, shape (N_MAP_CH, H, W)
+    aux_feat : np.ndarray, float32, shape (N_AUX,)
+    """
+    uid     = int(agent_id)
+    grid    = np.asarray(obs["map"])              # (H, W) int
+    players = np.asarray(obs["players"])          # (N, 5): x,y,alive,bombs_left,radius
+    H, W    = grid.shape
+    N       = players.shape[0]
+
+    my_x       = players[uid, 0]
+    my_y       = players[uid, 1]
+    my_alive   = players[uid, 2]
+    my_bleft   = players[uid, 3]
+    my_radius  = players[uid, 4]
+
+    # ── terrain one-hot (cell types 0..4: grass, wall, box, item_rad, item_cap)
+    ch_terrain = [(grid == v).astype(np.float32) for v in range(5)]   # 5 channels
+
+    # ── self position
+    ch_me = np.zeros((H, W), dtype=np.float32)
+    if int(my_alive):
+        ch_me[int(my_x), int(my_y)] = 1.0
+
+    # ── all enemy positions merged into one channel
+    ch_foes = np.zeros((H, W), dtype=np.float32)
+    n_alive_foes = 0
+    for pid in range(N):
+        if pid == uid:
+            continue
+        fx, fy, fa = players[pid, 0], players[pid, 1], players[pid, 2]
+        if int(fa):
+            ch_foes[int(fx), int(fy)] = 1.0
+            n_alive_foes += 1
+
+    # ── bomb channels: normalised timer, my bombs, enemy bombs
+    bombs_raw = obs["bombs"]
+    if len(bombs_raw) == 0:
+        bombs = np.zeros((0, 4), dtype=np.float32)
+    else:
+        bombs = np.asarray(bombs_raw, dtype=np.float32)
+        if bombs.ndim == 1:
+            bombs = bombs.reshape(1, -1)
+
+    ch_timer  = np.zeros((H, W), dtype=np.float32)
+    ch_mybomb = np.zeros((H, W), dtype=np.float32)
+    ch_fobomb = np.zeros((H, W), dtype=np.float32)
+    for b in bombs:
+        bx, by = int(b[0]), int(b[1])
+        tmr, own = float(b[2]), int(b[3])
+        t = tmr / BOMB_TIMER_MAX
+        ch_timer[bx, by]  = max(ch_timer[bx, by], t)
+        if own == uid:
+            ch_mybomb[bx, by] = 1.0
+        else:
+            ch_fobomb[bx, by] = 1.0
+
+    # ── stack → (10, H, W)
+    map_feat = np.stack(
+        ch_terrain + [ch_me, ch_foes, ch_timer, ch_mybomb, ch_fobomb],
+        axis=0,
+    ).astype(np.float32)
+
+    # ── auxiliary scalars
+    aux_feat = np.array([
+        float(my_bleft)  / BOMB_CAP_MAX,
+        float(my_radius) / BOMB_RADIUS_MAX,
+        n_alive_foes     / max(N - 1, 1),
+    ], dtype=np.float32)
+
+    return map_feat, aux_feat
+
+
+# ── Neural network ─────────────────────────────────────────────────────────────
+class DQNModel(nn.Module):
+    """
+    2-layer Conv + small MLP head.
+    batch=1 on 13×13 CPU: ~2 ms  →  well within 100ms budget.
+    TorchScript-compatible (no dynamic shapes, no Python-only ops).
+    """
+
+    def __init__(self, map_shape: tuple, aux_dim: int, num_actions: int) -> None:
+        super().__init__()
+        c, h, w = map_shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.ReLU(),
+        )
+        with torch.no_grad():
+            flat = int(self.conv(torch.zeros(1, c, h, w)).reshape(1, -1).size(1))
+        self.aux_net = nn.Sequential(nn.Linear(aux_dim, 32), nn.ReLU())
+        self.head    = nn.Sequential(
+            nn.Linear(flat + 32, 128), nn.ReLU(),
+            nn.Linear(128, num_actions),
+        )
+
+    def forward(self, map_x: torch.Tensor, aux_x: torch.Tensor) -> torch.Tensor:
+        spatial = self.conv(map_x).flatten(1)
+        aux     = self.aux_net(aux_x)
+        return self.head(torch.cat([spatial, aux], dim=1))
+
+
+# ── Replay buffer ──────────────────────────────────────────────────────────────
 class ReplayBuffer:
-    """Pre-allocated numpy circular buffer — sample() is pure array indexing, no Python objects."""
-    def __init__(self, capacity: int, map_shape, aux_dim: int):
-        self.capacity  = capacity
-        self.pos       = 0
-        self.size      = 0
-        self.map_shape = tuple(map_shape)
-        self.aux_dim   = int(aux_dim)
-        self.map_states      = np.zeros((capacity, *self.map_shape), dtype=np.float32)
-        self.aux_states      = np.zeros((capacity, self.aux_dim), dtype=np.float32)
-        self.next_map_states = np.zeros((capacity, *self.map_shape), dtype=np.float32)
-        self.next_aux_states = np.zeros((capacity, self.aux_dim), dtype=np.float32)
-        self.actions     = np.zeros(capacity,              dtype=np.int64)
-        self.rewards     = np.zeros(capacity,              dtype=np.float32)
-        self.dones       = np.zeros(capacity,              dtype=np.float32)
+    """Pre-allocated numpy circular buffer — O(1) push, O(batch) sample."""
+
+    def __init__(self, cap: int, map_shape: tuple, aux_dim: int):
+        self.cap  = cap
+        self.pos  = 0
+        self.size = 0
+        ms, ad    = tuple(map_shape), int(aux_dim)
+        self.sm   = np.zeros((cap, *ms), dtype=np.float32)
+        self.sa   = np.zeros((cap, ad),  dtype=np.float32)
+        self.nsm  = np.zeros((cap, *ms), dtype=np.float32)
+        self.nsa  = np.zeros((cap, ad),  dtype=np.float32)
+        self.acts = np.zeros(cap,        dtype=np.int64)
+        self.rews = np.zeros(cap,        dtype=np.float32)
+        self.done = np.zeros(cap,        dtype=np.float32)
+
+    def push(self, sm, sa, a, r, nsm, nsa, d):
+        p         = self.pos = (self.pos + 1) % self.cap
+        self.size = min(self.size + 1, self.cap)
+        self.sm[p]=sm;   self.sa[p]=sa
+        self.nsm[p]=nsm; self.nsa[p]=nsa
+        self.acts[p]=a;  self.rews[p]=r;  self.done[p]=d
+
+    def sample(self, n: int):
+        idx = np.random.randint(0, self.size, n)
+        return (self.sm[idx], self.sa[idx], self.nsm[idx], self.nsa[idx],
+                self.acts[idx], self.rews[idx], self.done[idx])
 
     def __len__(self):
         return self.size
 
-    def push(self, map_state, aux_state, action, reward, next_map_state, next_aux_state, done):
-        self.pos  = (self.pos + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-        self.map_states[self.pos]      = map_state
-        self.aux_states[self.pos]      = aux_state
-        self.next_map_states[self.pos] = next_map_state
-        self.next_aux_states[self.pos] = next_aux_state
-        self.actions[self.pos]     = action
-        self.rewards[self.pos]     = reward
-        self.dones[self.pos]       = done
 
-    def sample(self, batch_size: int):
-        idx = np.random.randint(0, self.size, size=batch_size)
-        return (
-            self.map_states[idx],
-            self.aux_states[idx],
-            self.next_map_states[idx],
-            self.next_aux_states[idx],
-            self.actions[idx],
-            self.rewards[idx],
-            self.dones[idx],
-        )
-
-class DQNModel(nn.Module):
-    """
-    Two-branch DQN:
-      - Conv2D branch for spatial map/object channels
-      - MLP branch for auxiliary scalar features
-    """
-    def __init__(self, map_shape, aux_dim, output_dim):
-        super().__init__()
-        c, h, w = map_shape
-        self.map_encoder = nn.Sequential(
-            nn.Conv2d(c, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-
-        with torch.no_grad():
-            dummy = torch.zeros(1, c, h, w)
-            conv_out_dim = self.map_encoder(dummy).reshape(1, -1).size(1)
-
-        self.aux_encoder = nn.Sequential(
-            nn.Linear(aux_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(conv_out_dim + 32, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim),
-        )
-    
-    def forward(self, map_x, aux_x):
-        map_feat = self.map_encoder(map_x).reshape(map_x.size(0), -1)
-        aux_feat = self.aux_encoder(aux_x)
-        feat = torch.cat([map_feat, aux_feat], dim=1)
-        return self.head(feat)
-
-def encode_obs(obs, agent_ids):
-    """
-    Returns:
-      map_feat: spatial tensor for Conv2D branch, shape (C, H, W)
-      aux_feat: scalar tensor for auxiliary branch, shape (A,)
-
-    agent_ids: int (user's player id) or list/tuple [user_id, opp_id].
-    When a single int is given the enemy is inferred as the other
-    player in a 2-player game (1 - user_id).
-    """
-    if obs is None:
-        raise ValueError("obs should not be None")
-
-    # Normalise agent_ids to (user_id, opp_id)
-    user_id = int(agent_ids[0])
-    opp_id  = int(agent_ids[1]) if len(agent_ids) > 1 else (1 - user_id)
-
-    grid    = obs["map"]      # (H, W)
-    players = obs["players"]  # (num_players, 5)
-    bombs   = obs["bombs"]    # (N, 4), N may be 0
-    H, W    = grid.shape
-
-    # One-hot map: grass, wall, box, item_radius, item_capacity
-    map_channels = []
-    for v in [Map.GRASS, Map.WALL, Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY]:
-        map_channels.append((grid == v).astype(np.float32))
-    # Player position masks
-    my_x, my_y, my_alive, my_bombs_left, my_radius_bonus = players[user_id]
-    ox,   oy,   opp_alive, _,            _               = players[opp_id]
-    my_pos  = np.zeros((H, W), dtype=np.float32)
-    opp_pos = np.zeros((H, W), dtype=np.float32)
-    if int(my_alive)  == 1:
-        my_pos[int(my_x), int(my_y)] = 1.0
-    if int(opp_alive) == 1:
-        opp_pos[int(ox), int(oy)]    = 1.0
-
-    # Bomb channels — bombs is a numpy array, not a list of Bomb objects
-    bomb_timer = np.zeros((H, W), dtype=np.float32)
-    bomb_owned = np.zeros((H, W), dtype=np.float32)
-    for b in bombs:
-        bx, by, timer, owner_id = b
-        bx, by = int(bx), int(by)
-        t = float(timer) / BOMB_MAX_TIMER  # normalise by default max timer
-        bomb_timer[bx, by] = max(bomb_timer[bx, by], t)
-        bomb_owned[bx, by] = 1.0 if int(owner_id) == user_id else 0.0
-
-    scalar = np.array([
-        float(my_bombs_left)   / Player.MAX_BOMB_CAPACITY,
-        float(my_radius_bonus) / Player.MAX_BOMB_RADIUS,
-        float(opp_alive),
-    ], dtype=np.float32)
-
-    map_feat = np.stack([
-        *map_channels,          # 5 channels
-        my_pos,                 # 1 channel
-        opp_pos,                # 1 channel
-        bomb_timer,             # 1 channel
-        bomb_owned,             # 1 channel
-    ], axis=0).astype(np.float32)  # (9, H, W)
-    return map_feat, scalar
-
+# ── Training agent ─────────────────────────────────────────────────────────────
 class TrainingAgent:
-    """
-    Agent class for DQN training and evaluation.
-    Args:
-        agent_id: int
-        input_dim: int
-        num_actions: int
-        lr: float
-        device: str
-        pretrained_model: str
-    Returns:
-        None
-    """
     team_id = "DQNAgent"
-    
-    def __init__(self, agent_id: int, input_spec, num_actions: int, lr: float=1e-3, device: str="cpu", pretrained_model=None):
-        self.agent_id = agent_id
-        self.num_actions = num_actions
-        self.device = device
-        self.gamma = 0.99
-        self.lr = lr
-        self.global_step = 0
-        self.epsilon = 1.0
 
-        # Networks: Q-Network (learning) and Target-Network (stable target)
+    def __init__(self, agent_id: int, input_spec, num_actions: int,
+                 lr: float = 3e-4, device: str = "cpu",
+                 pretrained_model: str = None):
+        self.agent_id    = agent_id
+        self.num_actions = num_actions
+        self.device      = device
+        self.gamma       = 0.99
+        self.global_step = 0
+        self.epsilon     = 1.0
+        self.lr          = lr
+
         if pretrained_model:
-            self.load_agent(pretrained_model)
+            self._load_checkpoint(pretrained_model)
         else:
             self.map_shape = tuple(input_spec[0])
-            self.aux_dim = int(input_spec[1])
-            self.q_net = DQNModel(self.map_shape, self.aux_dim, num_actions).to(device)
-            self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr, eps=1e-08, weight_decay=1e-5)
+            self.aux_dim   = int(input_spec[1])
+            self.q_net     = DQNModel(self.map_shape, self.aux_dim,
+                                      num_actions).to(device)
+            self.optimizer = optim.Adam(
+                self.q_net.parameters(), lr=lr, eps=1e-8, weight_decay=1e-5)
 
-        self.target_net = DQNModel(self.map_shape, self.aux_dim, num_actions).to(device)
-        self.target_net.load_state_dict(self.q_net.state_dict()) # Sync weights initially
-        
-        self.loss_fn = nn.MSELoss()
+        self.target_net = DQNModel(
+            self.map_shape, self.aux_dim, num_actions).to(device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+        self.loss_fn = nn.SmoothL1Loss()   # Huber loss — robust to reward outliers
 
-    def act(self, map_state, aux_state, epsilon=0.0):
-        """
-        Take an action based on the state.
-        Args:
-            map_state: np.ndarray
-            aux_state: np.ndarray
-            epsilon: float
-        Returns:
-            action: int
-        """
-        # Epsilon-Greedy Action Selection
+    # ── inference ──────────────────────────────────────────────────────────────
+    def act(self, map_s: np.ndarray, aux_s: np.ndarray,
+            epsilon: float = 0.0) -> int:
         if random.random() < epsilon:
-            return random.randint(0, self.num_actions - 1)
-        
-        map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
-        aux_tensor = torch.from_numpy(aux_state).unsqueeze(0).to(self.device)
+            return random.randrange(self.num_actions)
+        with torch.no_grad():
+            mt = torch.from_numpy(map_s).unsqueeze(0).to(self.device)
+            at = torch.from_numpy(aux_s).unsqueeze(0).to(self.device)
+            return int(self.q_net(mt, at).argmax().item())
+
+    # ── Double DQN update ──────────────────────────────────────────────────────
+    def train_step(self, sm, sa, nsm, nsa, acts, rews, dones) -> float:
+        dev = self.device
+
+        def t(x: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(x).to(dev)
+
+        sm_t  = t(sm);   sa_t  = t(sa)
+        nsm_t = t(nsm);  nsa_t = t(nsa)
+        a_t   = t(acts).unsqueeze(1)        # (B,1) int64
+        r_t   = t(rews).unsqueeze(1)        # (B,1) float32
+        d_t   = t(dones).unsqueeze(1)       # (B,1) float32
+
+        # Current Q(s,a)
+        q_curr = self.q_net(sm_t, sa_t).gather(1, a_t)
 
         with torch.no_grad():
-            action = self.q_net(map_tensor, aux_tensor).argmax().item()
-            
-        # action with the highest predicted Q-value
-        return action
+            # Double DQN: select with q_net, evaluate with target_net
+            best_a  = self.q_net(nsm_t, nsa_t).argmax(1, keepdim=True)
+            q_next  = self.target_net(nsm_t, nsa_t).gather(1, best_a)
+            q_target = r_t + self.gamma * q_next * (1.0 - d_t)
 
-    def train_step(self, map_state, aux_state, next_map_state, next_aux_state, action, reward, done):
-        """
-        Train the DQN agent for one step.
-        Args:
-            state: np.ndarray
-            action: int
-            reward: float
-            next_state: np.ndarray
-            done: bool
-        Returns:
-            None
-        """
-        # torch.from_numpy is zero-copy; only move to device when not CPU
-        map_state_t      = torch.from_numpy(map_state)
-        aux_state_t      = torch.from_numpy(aux_state)
-        next_map_state_t = torch.from_numpy(next_map_state)
-        next_aux_state_t = torch.from_numpy(next_aux_state)
-        action_t     = torch.from_numpy(action).unsqueeze(1)
-        reward_t     = torch.from_numpy(reward).unsqueeze(1)
-        done_t       = torch.from_numpy(done).unsqueeze(1)
-        if self.device != "cpu":
-            map_state_t      = map_state_t.to(self.device)
-            aux_state_t      = aux_state_t.to(self.device)
-            next_map_state_t = next_map_state_t.to(self.device)
-            next_aux_state_t = next_aux_state_t.to(self.device)
-            action_t     = action_t.to(self.device)
-            reward_t     = reward_t.to(self.device)
-            done_t       = done_t.to(self.device)
-
-        # 2. Calculate current Q-values: Q(s, a)
-        # gather() extracts the Q-value for the specific action taken
-        q_values = self.q_net(map_state_t, aux_state_t).gather(1, action_t)
-
-        # max(1)[0] gets the max Q-value for the next state
-            # ~ max_a' {Q(s', a', weights)}
-        # If done=1, the future reward is 0.
-            # Q*(s, a) = E[r + gamma * max_a' {Q*(s', a')}]
-            # ~ Q(s, a) = r + gamma * max_a' {Q(s', a', weights)} if not done else Q(s, a) = r
-        # inference_mode is stricter than no_grad: disables autograd engine entirely
-        with torch.no_grad():
-            max_next_q = self.target_net(next_map_state_t, next_aux_state_t).max(1)[0].unsqueeze(1)
-            target_q   = reward_t + self.gamma * max_next_q * (1 - done_t)
-
-        loss = self.loss_fn(q_values, target_q)
-        self.optimizer.zero_grad(set_to_none=True)  # skip memset, just nullify refs
+        loss = self.loss_fn(q_curr, q_target)
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
         self.global_step += 1
-        return loss.item()
-        
-    def update_target_network(self):
-        """Copies the learned weights into the target network."""
+        return float(loss.item())
+
+    def sync_target(self):
         self.target_net.load_state_dict(self.q_net.state_dict())
 
-    def load_agent(self, pretrained_model):
-        checkpoint = torch.load(pretrained_model, map_location=self.device)
-        input_spec = checkpoint.get("input_spec", checkpoint.get("input_shape", checkpoint["input_dim"]))
-        self.map_shape = tuple(input_spec[0])
-        self.aux_dim = int(input_spec[1])
-        self.num_actions = checkpoint["num_actions"]
-        self.q_net = DQNModel(self.map_shape, self.aux_dim, self.num_actions).to(self.device)
-        self.q_net.load_state_dict(checkpoint["model_state_dict"])
-        self.lr = checkpoint["lr"]
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr, eps=1e-08, weight_decay=1e-5)
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.global_step = checkpoint["global_step"]
-        self.epsilon = checkpoint["epsilon"]
+    # ── export ─────────────────────────────────────────────────────────────────
+    def export_torchscript(self, path: str):
+        """Save as TorchScript for fastest possible CPU inference."""
+        self.q_net.eval()
+        scripted = torch.jit.script(self.q_net)
+        scripted.save(path)
+        print(f"[TorchScript] saved → {path}")
 
-def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, seed=86, save_model=True, pretrained_model=None):
-    # Training-only imports - placed here so they don't run when the evaluator loads this file
-    import sys as _sys
-    from pathlib import Path as _Path
-    _root = _Path(__file__).resolve().parent.parent.parent
-    if str(_root) not in _sys.path:
-        _sys.path.insert(0, str(_root))
-    from reward import compute_reward  
-    from utils import (plot_loss, plot_rewards, plot_win_rates, 
-                       plot_moving_average, seed_everything, save_model_fn)
-    from agent import (SimpleRuleAgent, SmarterRuleAgent, 
-                       TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent)
-    from engine import BomberEnv 
+    # ── checkpoint I/O ─────────────────────────────────────────────────────────
+    def save_checkpoint(self, path: str, epsilon: float, input_spec):
+        from utils import save_model_fn
+        save_model_fn(self.q_net, self.optimizer, self.global_step,
+                      epsilon, self.lr, input_spec, self.num_actions, path)
 
-    env = BomberEnv(max_steps=max_steps, seed=seed)
-    if enemy_type == "simple":
-        enemy_agent = SimpleRuleAgent(1)
-    elif enemy_type == "smarter":
-        enemy_agent = SmarterRuleAgent(1)
-    elif enemy_type == "tactical":
-        enemy_agent = TacticalRuleAgent(1)
-    elif enemy_type == "genius":
-        enemy_agent = GeniusRuleAgent(1)
-    elif enemy_type == "box_farmer":
-        enemy_agent = BoxFarmerAgent(1)
-    else:
-        raise ValueError(f"Invalid enemy type: {enemy_type}")
+    def _load_checkpoint(self, path: str):
+        ck = torch.load(path, map_location=self.device)
+        sp = ck.get("input_spec", ck.get("input_shape", ck.get("input_dim")))
+        self.map_shape   = tuple(sp[0])
+        self.aux_dim     = int(sp[1])
+        self.num_actions = int(ck["num_actions"])
+        self.q_net       = DQNModel(
+            self.map_shape, self.aux_dim, self.num_actions).to(self.device)
+        self.q_net.load_state_dict(ck["model_state_dict"])
+        self.lr          = float(ck.get("lr", 3e-4))
+        self.optimizer   = optim.Adam(
+            self.q_net.parameters(), lr=self.lr, eps=1e-8, weight_decay=1e-5)
+        self.optimizer.load_state_dict(ck["optimizer_state_dict"])
+        self.global_step = int(ck.get("global_step", 0))
+        self.epsilon     = float(ck.get("epsilon", 0.1))
 
-    # hyperparam
-    epsilon_start      = 1.0
-    epsilon_min        = 0.05
-    epsilon_decay      = 0.995
-    epsilon            = epsilon_start
-    batch_size         = 64
-    lr                 = 1e-3
 
-    dummy_obs = env.reset(seed=seed)
-    agent_ids = [user_id, enemy_agent.agent_id]
-    sample_state = encode_obs(dummy_obs, agent_ids=agent_ids)
-    input_spec = (sample_state[0].shape, sample_state[1].shape[0])
-    num_actions = 6
+# ── Training loop ──────────────────────────────────────────────────────────────
+def train_dqn(
+    user_id: int      = 0,
+    enemy_types       = ("simple",),   # up to 3 enemies
+    num_episodes: int = 200,
+    max_steps: int    = 500,
+    seed: int         = 86,
+    save_model: bool  = True,
+    pretrained_model  = None,
+):
+    """
+    Train DQN against 1-3 rule-based enemies.
+    Enemies get IDs 1, 2, 3 (user always gets ID 0).
+    """
+    import sys, os
+    from pathlib import Path as _P
+    _root = _P(__file__).resolve().parent.parent.parent
+    if str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
 
-    user_agent = TrainingAgent(user_id, input_spec, num_actions, lr=lr, device="cuda" if torch.cuda.is_available() else "cpu", pretrained_model=pretrained_model)
-    buffer = ReplayBuffer(capacity=10_000, map_shape=input_spec[0], aux_dim=input_spec[1])
+    from reward import compute_reward
+    from utils  import (plot_loss, plot_rewards, plot_win_rates,
+                        plot_moving_average, save_model_fn)
+    from agent  import (SimpleRuleAgent, SmarterRuleAgent,
+                        TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent)
+    from engine import BomberEnv
 
-    global_step = 0
-    loss_history = []
-    reward_history = []
-    win_history = []
-    with tqdm(total=num_episodes, desc="Training DQN") as pbar:
+    _CLS = {
+        "simple":     SimpleRuleAgent,
+        "smarter":    SmarterRuleAgent,
+        "tactical":   TacticalRuleAgent,
+        "genius":     GeniusRuleAgent,
+        "box_farmer": BoxFarmerAgent,
+    }
+
+    env     = BomberEnv(max_steps=max_steps, seed=seed)
+    enemies = [_CLS[et](i + 1) for i, et in enumerate(list(enemy_types)[:3])]
+
+    # ── Hyperparams
+    epsilon       = 1.0
+    epsilon_min   = 0.05
+    epsilon_decay = 0.9995
+    batch_size    = 128
+    lr            = 3e-4
+    buffer_cap    = 100_000
+    target_freq   = 500    # sync target every N gradient steps
+    ckpt_freq     = 500    # save checkpoint every N episodes
+
+    # ── Bootstrap
+    dummy_obs          = env.reset(seed=seed)
+    ms, xs             = encode_obs(dummy_obs, user_id)
+    input_spec         = (ms.shape, xs.shape[0])
+    device             = "cuda" if torch.cuda.is_available() else "cpu"
+
+    agent   = TrainingAgent(user_id, input_spec, NUM_ACTIONS, lr=lr,
+                            device=device, pretrained_model=pretrained_model)
+    epsilon = agent.epsilon if pretrained_model else epsilon
+    buf     = ReplayBuffer(buffer_cap, input_spec[0], input_spec[1])
+
+    tag = "dqn_" + "_".join(enemy_types) + f"_{num_episodes}ep_{seed}seed"
+    os.makedirs(f"ckpts/{tag}", exist_ok=True)
+
+    loss_h, rew_h, win_h = [], [], []
+
+    with tqdm(total=num_episodes, desc=f"Training vs {list(enemy_types)}") as pbar:
         for ep in range(num_episodes):
-            obs = env.reset(seed=seed + ep)
-            done = False
-            prev_obs = None
-            total_reward = 0
-
-            map_state, aux_state = encode_obs(obs, agent_ids)
+            obs       = env.reset(seed=seed + ep)
+            prev_obs  = None
+            ms, xs    = encode_obs(obs, user_id)
+            ep_rew    = 0.0
+            n_players = int(np.asarray(obs["players"]).shape[0])
 
             for _ in range(max_steps):
-                # 1. Action
-                user_action  = user_agent.act(map_state, aux_state, epsilon=epsilon)
-                enemy_action = enemy_agent.act(obs)
-                actions = [None, None]
-                actions[user_id]              = user_action
-                actions[enemy_agent.agent_id] = enemy_action
+                # ── Actions for all players
+                act      = agent.act(ms, xs, epsilon)
+                all_acts = [None] * n_players
+                all_acts[user_id] = act
+                for e in enemies:
+                    if e.agent_id < n_players:
+                        all_acts[e.agent_id] = e.act(obs)
 
-                # 2. Environment Step
-                next_obs, terminated, truncated = env.step(actions)
+                nobs, terminated, truncated = env.step(all_acts)
                 done = terminated or truncated
 
-                # 3. Reward
-                r = compute_reward(prev_obs, next_obs, agent_id=user_id)
-                total_reward += r
-                reward_history.append(r)
-                if done:
-                    win_history.append(1 if next_obs["players"][user_id][2] else 0)
-                
-                # 4. Buffer Push
-                next_map_state, next_aux_state = encode_obs(next_obs, agent_ids)
-                buffer.push(map_state, aux_state, user_action, r, next_map_state, next_aux_state, done)
+                r      = compute_reward(prev_obs, nobs, agent_id=user_id)
+                ep_rew += r
 
-                # 5. Train
-                global_step += 1
-                if len(buffer) >= batch_size:
-                    sampled_map_state, sampled_aux_state, sampled_next_map_state, sampled_next_aux_state, sampled_action, sampled_reward, sampled_done = buffer.sample(batch_size)
-                    loss = user_agent.train_step(
-                        sampled_map_state,
-                        sampled_aux_state,
-                        sampled_next_map_state,
-                        sampled_next_aux_state,
-                        sampled_action,
-                        sampled_reward,
-                        sampled_done,
-                    )
-                    loss_history.append(loss)
+                nms, nxs = encode_obs(nobs, user_id)
+                buf.push(ms, xs, act, r, nms, nxs, float(done))
 
-                # 6. Update
-                prev_obs  = obs
-                obs       = next_obs
-                map_state = next_map_state
-                aux_state = next_aux_state
+                # ── Learn
+                if len(buf) >= batch_size:
+                    loss = agent.train_step(*buf.sample(batch_size))
+                    loss_h.append(loss)
 
-                # 7. Done
+                # ── Sync target (step-based)
+                if agent.global_step % target_freq == 0:
+                    agent.sync_target()
+
+                prev_obs = obs;  obs = nobs
+                ms = nms;        xs  = nxs
                 if done:
                     break
 
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
-            if ep % 10 == 0:
-                user_agent.update_target_network()
+
+            alive = int(np.asarray(nobs["players"])[user_id, 2])
+            win_h.append(alive)
+            rew_h.append(ep_rew)
+
             pbar.update(1)
-            pbar.set_postfix(reward=f"{total_reward:.2f}", epsilon=f"{epsilon:.3f}")
+            wr100 = sum(win_h[-100:]) / min(100, len(win_h))
+            pbar.set_postfix(rew=f"{ep_rew:.1f}", eps=f"{epsilon:.3f}",
+                             wr=f"{wr100:.2f}", step=agent.global_step)
 
-    model_folder = f"ckpts/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed"
+            # ── Mid-training checkpoint
+            if save_model and (ep + 1) % ckpt_freq == 0:
+                cp = f"ckpts/{tag}/ep{ep+1}_{agent.global_step}s.pth"
+                agent.save_checkpoint(cp, epsilon, input_spec)
+                print(f"\n[ckpt] {cp}")
+
+    # ── Final save
+    final_pth = f"ckpts/{tag}/model.pth"
+    final_pt  = f"ckpts/{tag}/model.pt"
     if save_model:
-        model_path = f"{model_folder}/{user_agent.global_step}_global_step.pth"
-        save_model_fn(user_agent.q_net, 
-                    user_agent.optimizer, 
-                    user_agent.global_step, 
-                    user_agent.epsilon, 
-                    user_agent.lr, 
-                    input_spec,
-                    num_actions,
-                    model_path)
-        
-    plot_loss(loss_history=loss_history, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_loss.png")
-    plot_rewards(reward_history=reward_history, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_rewards.png")
-    plot_win_rates(win_history=win_history, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_win_rates.png")
-    plot_moving_average(data=reward_history, window_size=10, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_moving_average.png")
+        agent.save_checkpoint(final_pth, epsilon, input_spec)
+        agent.export_torchscript(final_pt)
+        print(f"\n✓ Checkpoint : {final_pth}"
+              f"\n✓ TorchScript: {final_pt}  ← copy this to submission folder")
 
+    # ── Plots
+    plot_loss(loss_h,      f"ckpts/{tag}/loss.png")
+    plot_rewards(rew_h,    f"ckpts/{tag}/rewards.png")
+    plot_win_rates(win_h,  f"ckpts/{tag}/win_rate.png")
+    plot_moving_average(rew_h, 50, f"ckpts/{tag}/ma_reward.png")
+
+    return final_pth, final_pt
+
+
+# ── CLI + Curriculum ───────────────────────────────────────────────────────────
 def training():
     from utils import seed_everything
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--enemy_type", type=str, default="simple", choices=["simple", "smarter", "tactical", "genius", "box_farmer"])
-    parser.add_argument("--num_episodes", type=int, default=200, help="Number of episodes to train")
-    parser.add_argument("--max_steps", type=int, default=500, help="Maximum number of steps per episode")
-    parser.add_argument("--seed", type=int, default=86, help="Random seed for reproducibility")
-    parser.add_argument("--save_model", action="store_true", help="Save model")
-    parser.add_argument("--load_model", type=str, default=None, help="Load model")
-    parser.add_argument("--skip_training", action="store_true", help="Skip training")
-    args = parser.parse_args()
-    
+
+    p = argparse.ArgumentParser(description="Bomberland DQN trainer")
+    p.add_argument("--enemy_types", nargs="+", default=["simple"],
+                   choices=["simple","smarter","tactical","genius","box_farmer"],
+                   help="1-3 enemy types (e.g. --enemy_types tactical genius)")
+    p.add_argument("--num_episodes",  type=int, default=200)
+    p.add_argument("--max_steps",     type=int, default=500)
+    p.add_argument("--seed",          type=int, default=86)
+    p.add_argument("--save_model",    action="store_true", default=True)
+    p.add_argument("--no_save",       dest="save_model", action="store_false")
+    p.add_argument("--load_model",    type=str, default=None,
+                   help="Path to .pth checkpoint to resume from")
+    p.add_argument("--curriculum",    action="store_true",
+                   help="Run 4-stage curriculum: simple→smarter→tactical→tactical+genius")
+    p.add_argument("--curriculum_episodes", nargs=4, type=int,
+                   default=[2000, 2000, 3000, 3000],
+                   help="Episodes per curriculum stage")
+    args = p.parse_args()
     seed_everything(args.seed)
-    print("Skip training? ", args.skip_training)
-    if not args.skip_training:
-        train_dqn(enemy_type=args.enemy_type, 
-                    num_episodes=args.num_episodes, 
-                    max_steps=args.max_steps, 
-                    seed=args.seed, 
-                    save_model=args.save_model,
-                    pretrained_model=args.load_model)
-    
-# Mandatory for submission
+
+    if args.curriculum:
+        # Stage 3 uses 1 tactical; Stage 4 uses tactical + genius (2 enemies)
+        STAGES = [
+            (["simple"],              args.curriculum_episodes[0]),
+            (["smarter"],             args.curriculum_episodes[1]),
+            (["tactical"],            args.curriculum_episodes[2]),
+            (["tactical", "genius"],  args.curriculum_episodes[3]),
+        ]
+        ckpt = args.load_model
+        for i, (etypes, n_ep) in enumerate(STAGES):
+            print(f"\n{'='*55}"
+                  f"\nCurriculum Stage {i+1}/{len(STAGES)}: {etypes} × {n_ep} ep"
+                  f"\n{'='*55}")
+            pth, _pt = train_dqn(
+                enemy_types=etypes, num_episodes=n_ep,
+                max_steps=args.max_steps, seed=args.seed + i,
+                save_model=True, pretrained_model=ckpt,
+            )
+            ckpt = pth   # load checkpoint (not TorchScript) for next stage
+            print(f"  → next stage loads: {ckpt}")
+    else:
+        train_dqn(
+            enemy_types=args.enemy_types,
+            num_episodes=args.num_episodes,
+            max_steps=args.max_steps,
+            seed=args.seed,
+            save_model=args.save_model,
+            pretrained_model=args.load_model,
+        )
+
+
+# ── Submission Agent ───────────────────────────────────────────────────────────
 class Agent:
-    """DQN Agent for submission."""    
+    """
+    Mandatory submission class.
+
+    File priority (all in Path(__file__).parent):
+      1. model.pt   — TorchScript (fastest CPU inference, ~2 ms/step)
+      2. model.pth  — regular checkpoint
+      3. *.pth      — any .pth file (legacy fallback)
+
+    The act() method must return an int in [0, 5] within 100 ms.
+    """
+
     def __init__(self, agent_id: int):
         self.agent_id = agent_id
-        self.device = torch.device("cpu")  # Use CPU for compatibility
-        self.q_net = None
-        self.map_shape = ((9, 13, 13))
-        self.aux_dim = 3
-        self.num_actions = 6
-        
-        # Load checkpoint from same directory as this file
-        checkpoint_path = Path(__file__).parent / "2737502_global_step.pth"
-        self._load_checkpoint(str(checkpoint_path))
-    
-    def _load_checkpoint(self, checkpoint_path):
-        """Load trained model from checkpoint."""
+        base = Path(__file__).parent
+
+        ts  = base / "model.pt"
+        pth = base / "model.pth"
+        leg = next(base.glob("*.pth"), None)
+
+        if ts.exists():
+            self._net = torch.jit.load(str(ts), map_location="cpu")
+            self._net.eval()
+        elif pth.exists():
+            self._net = self._from_pth(str(pth))
+        elif leg:
+            self._net = self._from_pth(str(leg))
+        else:
+            raise FileNotFoundError(
+                f"No model file found in {base}. "
+                "Expected model.pt or model.pth after training."
+            )
+
+    @staticmethod
+    def _from_pth(path: str) -> nn.Module:
+        ck  = torch.load(path, map_location="cpu")
+        sp  = ck.get("input_spec", ck.get("input_shape", ck.get("input_dim")))
+        ms  = tuple(sp[0])
+        ad  = int(sp[1])
+        na  = int(ck["num_actions"])
+        if ms[0] != N_MAP_CH or ad != N_AUX:
+            raise ValueError(
+                f"Checkpoint channels ({ms[0]}) or aux ({ad}) don't match "
+                f"current encoder ({N_MAP_CH} channels, {N_AUX} aux). "
+                "Please retrain with the updated agent.py."
+            )
+        net = DQNModel(ms, ad, na)
+        net.load_state_dict(ck["model_state_dict"])
+        net.eval()
+        return net
+
+    def act(self, obs: dict) -> int:
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Get input spec from checkpoint
-            input_spec = checkpoint.get("input_spec", 
-                                       checkpoint.get("input_shape", 
-                                                     checkpoint["input_dim"]))
-            self.map_shape = tuple(input_spec[0])
-            self.aux_dim = int(input_spec[1])
-            self.num_actions = checkpoint["num_actions"]
-            
-            # Create and load model
-            self.q_net = DQNModel(self.map_shape, self.aux_dim, self.num_actions)
-            self.q_net.load_state_dict(checkpoint["model_state_dict"])
-            self.q_net.to(self.device)
-            self.q_net.eval()  # Set to evaluation mode
-        except Exception as e:
-            print(f"[ERROR] Failed to load checkpoint: {e}")
-            raise
-    
-    def act(self, obs):
-        """
-        Take an action based on observation.
-        
-        Args:
-            obs: dict with keys 'map', 'players', 'bombs'
-        
-        Returns:
-            action: int in range [0, 5]
-        """
-        try:
-            # Encode observation
-            map_state, aux_state = encode_obs(obs, [self.agent_id])
-            
-            # Convert to tensors and add batch dimension
-            map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
-            aux_tensor = torch.from_numpy(aux_state).unsqueeze(0).to(self.device)
-            
-            # Get Q-values and select best action
+            ms, xs = encode_obs(obs, self.agent_id)
             with torch.no_grad():
-                q_values = self.q_net(map_tensor, aux_tensor)
-                action = q_values.argmax(dim=1).item()
-            
-            return action
+                return int(
+                    self._net(
+                        torch.from_numpy(ms).unsqueeze(0),
+                        torch.from_numpy(xs).unsqueeze(0),
+                    ).argmax(1).item()
+                )
         except Exception as e:
-            print(f"[ERROR] Agent.act() failed: {e}")
-            # Fallback to random action on error
-            return 0
-        
+            print(f"[Agent.act ERROR] {e}")
+            return 0   # STOP — safe fallback
+
 
 if __name__ == "__main__":
     training()
