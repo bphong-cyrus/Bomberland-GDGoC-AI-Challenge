@@ -7,7 +7,10 @@ You can find several baseline agents in this directory to use as a starting poin
 *   `random_agent.py`: Simple random actions.
 *   `simple_rule_agent.py`: Avoids bombs and places bombs.
 *   `tactical_rule_agent.py`: Uses BFS for pathfinding and targets enemies.
-*   `dqn_agent/`: A Deep Q-Network implementation (not chosen as one of the official baseline agents).
+*   `dqn_agent/`: A Dueling Double-DQN implementation with a danger-aware state
+    encoder, a safety/escape planner (hybrid rules+RL) and self-play training.
+    Submission files: `agent.py` + `model.py` + `model.pt`. Training lives in
+    `train.py` and is never imported by the submission.
 
 ## 🛠️ Developing Your Agent
 Your agent must be a Python class named `Agent` inside a file named `agent.py`. It must implement an `act` method:
@@ -28,34 +31,45 @@ class Agent:
 *   **Resources**: CPU-only evaluation. No GPU access.
 *   **Isolation**: No network access or file writing during the match.
 
-## Local Training (Kaggle)
+## Training on Kaggle
 
-Follow the provided steps to train DQN on Kaggle Platform: 
-1. Get github access token from github.com > Settings > Developer settings > Personal Access Tokens > Generate new token > Choose scope for the key (allow read repo) > Copy the key
-2. Create a new notebook on kaggle and add to Settings > Secrets > Key: any name for the key such as "dqn", Value: Paste the key here
-3. Paste the following code in 4 cells:
-```
-# Cell 1: Get token based on the key in Step 2
+The trainer is `agent/dqn_agent/train.py`. It must be run **as a module from the
+repo root** (so `engine`, the baselines and the model share one clean import
+path). Enable a GPU accelerator in the Kaggle notebook for the fastest learning.
+
+1. GitHub token: github.com > Settings > Developer settings > Personal Access
+   Tokens > Generate new token (read repo) > copy it.
+2. Kaggle notebook > Settings > Secrets > add Key `dqn`, Value = the token.
+3. Run these cells:
+```python
+# Cell 1 — token
 from kaggle_secrets import UserSecretsClient
-user_secrets = UserSecretsClient()
-secret_value_0 = user_secrets.get_secret("dqn") 
+tok = UserSecretsClient().get_secret("dqn")
 
-# Cell 2: Change the "your github username here"
-!git clone https://{your github username here}:{secret_value_0}@github.com/VLTisME/Bomberland-GDGoC-AI-Challenge.git
+# Cell 2 — clone YOUR fork (where the trained code lives)
+!git clone https://bphong-cyrus:{tok}@github.com/bphong-cyrus/Bomberland-GDGoC-AI-Challenge.git
 
-# Cell 3: Inspect to see any error
+# Cell 3 — deps + sanity
 %cd /kaggle/working/Bomberland-GDGoC-AI-Challenge
-%ls
+!pip -q install trueskill
+import torch; print("cuda:", torch.cuda.is_available())
 
-# Cell 4: Train 10000 episodes versus a tactical baseline agent
-!python /kaggle/working/Bomberland-GDGoC-AI-Challenge/agent/dqn_agent/agent.py --enemy_type tactical --num_episodes 10000 --save_model
+# Cell 4 — train (self-play vs a mix of strong baselines + frozen self snapshots)
+!python -m agent.dqn_agent.train \
+    --episodes 20000 --opponents mix \
+    --n_step 3 --batch_size 256 --buffer_cap 100000 \
+    --self_play_after 2000 --snapshot_every 1000 --eval_every 1000 \
+    --save_dir /kaggle/working/ckpts
+
+# Cell 5 — download for submission
+from IPython.display import FileLink
+FileLink('ckpts/selfplay_mix_20000ep/model.pt')
 ```
+Resume an interrupted run with `--resume ckpts/selfplay_mix_20000ep/epXXXX.pth`.
 
-**Tips**: To successfully submit your RL-based agent:
-* Keep training code inside `if __name__ == "__main__":`
-* Use `Path(__file__).parent` to load weights
-* Zip your files flat (not inside a folder)
-* **Or better:** keep only agent.py with class Agent and init & act methods and weights file in the same folder
+**Submission (flat zip):** put `agent.py`, `model.py` and the trained `model.pt`
+in the zip root (no folder). The trained `model.pt` is TorchScript, so the
+submission needs nothing but `numpy` + `torch`.
 
 ## 🧪 Local Testing
 

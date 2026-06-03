@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 logs/
 .venv
+env/
 ckpts/
 .vscode/
 *.db
