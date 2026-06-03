@@ -451,7 +451,7 @@ def train(
     target_freq=2000, eps_start=1.0, eps_end=0.05, eps_decay_episodes=8000,
     self_play_after=2000, snapshot_every=1000, pool_cap=10, learner_prob=0.6,
     shaping_lam=0.1, novelty_w=0.01, per=True, alpha=0.6, beta0=0.4,
-    eval_every=1000, save_dir="ckpts", resume=None,
+    eval_every=1000, save_dir="ckpts", resume=None, warm_from=None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device} episodes={episodes} n_step={n_step} "
@@ -476,6 +476,24 @@ def train(
         epsilon = float(ck.get("epsilon", eps_start))
         start_ep = int(ck.get("episode", 0))
         print(f"[resume] {resume} @ ep{start_ep} step{global_step} eps{epsilon:.3f}")
+    elif warm_from:
+        # Warm start from a TorchScript (model.pt) or .pth weights file: keep the
+        # learned weights but start a FRESH optimizer/epsilon/step counter (those
+        # were lost). Set --eps_start lower (e.g. 0.3) so it doesn't re-explore wildly.
+        if warm_from.endswith(".pt"):
+            scripted = torch.jit.load(warm_from, map_location=device)
+            src_sd = scripted.state_dict()
+        else:
+            ck = torch.load(warm_from, map_location=device)
+            src_sd = ck.get("model_state_dict", ck)
+        missing, unexpected = q_net.load_state_dict(src_sd, strict=False)
+        epsilon = eps_start            # fresh exploration schedule, controlled by --eps_start
+        print(f"[warm_from] {warm_from}  eps={epsilon:.3f}  "
+              f"(missing={len(missing)} unexpected={len(unexpected)} keys; "
+              f"fresh optimizer + step counter)")
+        if missing or unexpected:
+            print(f"[warm_from] WARNING key mismatch -> missing={missing[:4]} "
+                  f"unexpected={unexpected[:4]}")
     tgt_net.load_state_dict(q_net.state_dict())
     tgt_net.eval()
 
@@ -647,7 +665,13 @@ def main():
     p.add_argument("--per", type=_b, default=True)
     p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--save_dir", default="ckpts")
-    p.add_argument("--resume", default=None)
+    p.add_argument("--resume", default=None,
+                   help="resume FULL state from a .pth checkpoint (model+optimizer+epsilon+step)")
+    p.add_argument("--warm_from", default=None,
+                   help="warm start weights only from model.pt/.pth (fresh optimizer+epsilon; "
+                        "set --eps_start lower e.g. 0.3)")
+    p.add_argument("--eps_start", type=float, default=1.0)
+    p.add_argument("--eps_end", type=float, default=0.05)
     args = p.parse_args()
 
     seed_everything(args.seed)
@@ -659,6 +683,7 @@ def main():
         snapshot_every=args.snapshot_every, learner_prob=args.learner_prob,
         shaping_lam=args.shaping_lam, novelty_w=args.novelty_w, per=args.per,
         eval_every=args.eval_every, save_dir=args.save_dir, resume=args.resume,
+        warm_from=args.warm_from, eps_start=args.eps_start, eps_end=args.eps_end,
     )
 
 
