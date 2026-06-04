@@ -67,12 +67,18 @@ GRASS, WALL, BOX, ITEM_R, ITEM_C = 0, 1, 2, 3, 4
 REWARD = {
     "death":        -3.0,   # being eliminated — by far the worst outcome
     "sole_winner":   3.0,   # last agent standing
-    "survive_500":   0.5,   # reached the step cap alive
+    "survive_500":   0.1,   # reached the step cap alive (was 0.5: the safety mask
+                            # already prevents death, so a big bonus here just
+                            # taught passive turtling — the #1 cause of low rank)
     "kill":          1.0,   # an opponent you eliminated (your stats['kills'])
     "opp_died":      0.3,   # any opponent removed this step (rank improves)
     "box":           0.4,   # box you destroyed
     "item":          0.4,   # item you collected
-    "bomb":          0.0,   # no reward for merely placing a bomb (kills loitering)
+    "bomb":          0.0,   # no flat reward for placing a bomb (avoids spam)
+    "bomb_target":   0.10,  # placed a bomb whose blast threatens a box or enemy —
+                            # dense signal that teaches PURPOSEFUL aggression
+                            # (cures "loiter near spawn, never bomb")
+    "bomb_waste":   -0.02,  # placed a bomb that threatens nothing (discourages spam)
     "escape":        0.05,  # left a tile that was about to explode
     "step":         -0.01,  # mild time pressure (no idle-corner exploit)
     "novelty":       0.01,  # first visit to a tile this episode (map coverage)
@@ -145,6 +151,29 @@ def target_potential(grid, players, agent_id, lam, dmax=24.0):
     return 0.0
 
 
+def _bomb_threatens_target(grid, players, agent_id, bx, by, radius):
+    """True if a cross-shaped blast from (bx,by) of `radius` reaches a box or a
+    live enemy. Walls block the blast; a box is itself a valid target (and stops
+    the ray). Used to reward PURPOSEFUL bomb placement (vs. spamming bombs)."""
+    H, W = grid.shape
+    enemies = {(int(players[p][0]), int(players[p][1]))
+               for p in range(len(players))
+               if p != agent_id and int(players[p][2]) == 1}
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for r in range(1, radius + 1):
+            nx, ny = bx + dx * r, by + dy * r
+            if not (0 <= nx < H and 0 <= ny < W):
+                break
+            if (nx, ny) in enemies:
+                return True
+            c = grid[nx, ny]
+            if c == WALL:        # solid wall blocks the blast
+                break
+            if c == BOX:         # box is a target AND stops further blast
+                return True
+    return False
+
+
 def event_reward(prev_obs, obs, agent_id, prev_stats, stats,
                  prev_alive, alive, n_opp_died, terminal, sole_winner, truncated):
     """Stat/event reward for the transition prev_obs -> obs (no shaping)."""
@@ -162,6 +191,18 @@ def event_reward(prev_obs, obs, agent_id, prev_stats, stats,
     pl_now = np.asarray(obs["players"])
     px, py = int(pl_prev[agent_id][0]), int(pl_prev[agent_id][1])
     cx, cy = int(pl_now[agent_id][0]), int(pl_now[agent_id][1])
+
+    # purposeful-bomb shaping: a bomb was placed this step (bombs stat rose) at the
+    # agent's previous tile. Reward it only if its blast threatens a box/enemy;
+    # otherwise mildly penalise to discourage aimless bomb spam.
+    n_bomb = max(0, stats["bombs"] - prev_stats["bombs"])
+    if n_bomb > 0:
+        radius = 1 + int(pl_prev[agent_id][4])
+        if _bomb_threatens_target(grid, pl_prev, agent_id, px, py, radius):
+            r += REWARD["bomb_target"] * n_bomb
+        else:
+            r += REWARD["bomb_waste"] * n_bomb
+
     inst_prev, _ = compute_danger(grid, _bombs(prev_obs), pl_prev)
     prev_t = _min_instant_at(inst_prev, (px, py))
     if prev_t is not None and (px, py) != (cx, cy):
