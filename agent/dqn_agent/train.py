@@ -73,8 +73,11 @@ REWARD = {
                             # weak rule baselines but LOSES vs real opponents.
     "kill":          1.5,   # an opponent you eliminated (your stats['kills']) — up
     "opp_died":      0.4,   # any opponent removed this step (rank improves) — up
-    "box":           0.5,   # box you destroyed (opens the map + spawns items) — up
-    "item":          0.7,   # item collected = MORE bombs / bigger blast = the only
+    "box":           0.8,   # box you destroyed (opens map + spawns items). Pushed
+                            # hard: behaviour test showed the agent bombed 45x/game
+                            # but broke only 1.3 boxes (it hunted, never farmed) ->
+                            # stayed under-powered and lost on the leaderboard.
+    "item":          1.0,   # item collected = MORE bombs / bigger blast = the only
                             # way to out-power real opponents. Farm aggressively.
     "bomb":          0.0,   # no flat reward for placing a bomb (avoids spam)
     "bomb_target":   0.15,  # placed a bomb whose blast threatens a box or enemy —
@@ -173,7 +176,13 @@ def enemy_potential(players, agent_id, lam_e, dmax=24.0):
              if p != uid and int(players[p][2]) == 1]
     if not dists:
         return 0.0
-    return lam_e * (1.0 - min(min(dists), dmax) / dmax)
+    # scale the hunt-pull by the agent's power (bomb_radius_bonus): weak/unfarmed
+    # -> 0.3x (go farm boxes first), powered-up -> full pull (now go hunt). This
+    # creates a natural "farm early, fight late" arc instead of rushing enemies
+    # while still 1-bomb/radius-1 and getting out-powered.
+    power = int(players[uid][4])
+    scale = min(1.0, 0.3 + 0.35 * power)
+    return lam_e * scale * (1.0 - min(min(dists), dmax) / dmax)
 
 
 def total_potential(grid, players, agent_id, shaping_lam, enemy_w):
