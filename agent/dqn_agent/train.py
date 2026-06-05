@@ -51,14 +51,17 @@ from agent.dqn_agent.utils import (              # noqa: E402
 from engine.game import BomberEnv                # noqa: E402
 from agent import (                              # noqa: E402  (top-level baselines)
     RandomAgent, SimpleRuleAgent, SmarterRuleAgent,
-    TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent,
+    TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent, HunterAgent,
 )
 
 RULE_CLASSES = {
     "random": RandomAgent, "simple": SimpleRuleAgent, "smarter": SmarterRuleAgent,
     "tactical": TacticalRuleAgent, "genius": GeniusRuleAgent, "box_farmer": BoxFarmerAgent,
+    "hunter": HunterAgent,
 }
-STRONG_RULES = ["tactical", "genius", "smarter", "box_farmer"]
+# Hunter listed twice so it shows up ~2x as often as the others in a "mix" run:
+# camping only dies out if an aggressive hunter regularly comes to punish it.
+STRONG_RULES = ["tactical", "genius", "smarter", "box_farmer", "hunter", "hunter"]
 
 GRASS, WALL, BOX, ITEM_R, ITEM_C = 0, 1, 2, 3, 4
 
