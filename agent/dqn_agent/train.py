@@ -67,21 +67,25 @@ GRASS, WALL, BOX, ITEM_R, ITEM_C = 0, 1, 2, 3, 4
 REWARD = {
     "death":        -3.0,   # being eliminated — by far the worst outcome
     "sole_winner":   3.0,   # last agent standing
-    "survive_500":   0.1,   # reached the step cap alive (was 0.5: the safety mask
-                            # already prevents death, so a big bonus here just
-                            # taught passive turtling — the #1 cause of low rank)
-    "kill":          1.0,   # an opponent you eliminated (your stats['kills'])
-    "opp_died":      0.3,   # any opponent removed this step (rank improves)
-    "box":           0.4,   # box you destroyed
-    "item":          0.4,   # item you collected
+    "survive_500":   0.0,   # reached the step cap alive — REMOVED. Surviving is
+                            # already enforced by death=-3 + the safety mask, and
+                            # any bonus here just rewards turtling, which WINS vs
+                            # weak rule baselines but LOSES vs real opponents.
+    "kill":          1.5,   # an opponent you eliminated (your stats['kills']) — up
+    "opp_died":      0.4,   # any opponent removed this step (rank improves) — up
+    "box":           0.5,   # box you destroyed (opens the map + spawns items) — up
+    "item":          0.7,   # item collected = MORE bombs / bigger blast = the only
+                            # way to out-power real opponents. Farm aggressively.
     "bomb":          0.0,   # no flat reward for placing a bomb (avoids spam)
-    "bomb_target":   0.10,  # placed a bomb whose blast threatens a box or enemy —
-                            # dense signal that teaches PURPOSEFUL aggression
-                            # (cures "loiter near spawn, never bomb")
+    "bomb_target":   0.15,  # placed a bomb whose blast threatens a box or enemy —
+                            # dense signal that teaches PURPOSEFUL aggression — up
     "bomb_waste":   -0.02,  # placed a bomb that threatens nothing (discourages spam)
+    "camp":         -0.03,  # per-step penalty while stuck in an already-explored
+                            # pocket (see run_episode) — directly punishes the
+                            # "loiter in ~5 cells, never advance" failure mode
     "escape":        0.05,  # left a tile that was about to explode
     "step":         -0.01,  # mild time pressure (no idle-corner exploit)
-    "novelty":       0.01,  # first visit to a tile this episode (map coverage)
+    "novelty":       0.03,  # first visit to a tile this episode (map coverage) — up
 }
 
 
@@ -149,6 +153,33 @@ def target_potential(grid, players, agent_id, lam, dmax=24.0):
                 seen.add((nx, ny))
                 q.append((nx, ny, d + 1))
     return 0.0
+
+
+def enemy_potential(players, agent_id, lam_e, dmax=24.0):
+    """Potential that is higher when the agent is CLOSER (Manhattan) to the
+    nearest LIVE enemy. Manhattan (not BFS) so the pull exists even when boxes
+    block the path — the agent then bombs its way toward the fight instead of
+    farming one corner forever. Potential-based, so policy-invariant in theory:
+    it only adds a gradient that says "go engage", curing the
+    'bombs+dodges locally but never advances' local optimum."""
+    if lam_e <= 0:
+        return 0.0
+    uid = int(agent_id)
+    if int(players[uid][2]) != 1:
+        return 0.0
+    sx, sy = int(players[uid][0]), int(players[uid][1])
+    dists = [abs(sx - int(players[p][0])) + abs(sy - int(players[p][1]))
+             for p in range(len(players))
+             if p != uid and int(players[p][2]) == 1]
+    if not dists:
+        return 0.0
+    return lam_e * (1.0 - min(min(dists), dmax) / dmax)
+
+
+def total_potential(grid, players, agent_id, shaping_lam, enemy_w):
+    """Box/item-seeking shaping + always-on enemy-seeking shaping."""
+    return (target_potential(grid, players, agent_id, shaping_lam)
+            + enemy_potential(players, agent_id, enemy_w))
 
 
 def _bomb_threatens_target(grid, players, agent_id, bx, by, radius):
@@ -353,7 +384,7 @@ def final_ranks(env, death_order):
 
 # ── one self-play episode ────────────────────────────────────────────────────
 def run_episode(env, seed, q_net, learner_seats, opponents, epsilon, gamma,
-                n_step, shaping_lam, novelty_w):
+                n_step, shaping_lam, novelty_w, enemy_w):
     obs = env.reset(seed=seed)
     n = len(env.players)
     traj = {s: [] for s in learner_seats}
@@ -361,9 +392,10 @@ def run_episode(env, seed, q_net, learner_seats, opponents, epsilon, gamma,
     prev_alive = [bool(env.players[i].alive) for i in range(n)]
     death_order = []
     enc = {s: encode_obs(obs, s) for s in learner_seats}
-    phi = {s: target_potential(np.asarray(obs["map"]), np.asarray(obs["players"]), s, shaping_lam)
+    phi = {s: total_potential(np.asarray(obs["map"]), np.asarray(obs["players"]), s, shaping_lam, enemy_w)
            for s in learner_seats}
     visited = {s: {(int(obs["players"][s][0]), int(obs["players"][s][1]))} for s in learner_seats}
+    stale = {s: 0 for s in learner_seats}     # consecutive steps without a new tile
     dev = next(q_net.parameters()).device
 
     while True:
@@ -405,15 +437,24 @@ def run_episode(env, seed, q_net, learner_seats, opponents, epsilon, gamma,
             # potential-based shaping (Phi'=0 once dead/terminal)
             phi_next = 0.0
             if alive_now[s] and not done:
-                phi_next = target_potential(npl[0], npl[1], s, shaping_lam)
+                phi_next = total_potential(npl[0], npl[1], s, shaping_lam, enemy_w)
             r += gamma * phi_next - phi[s]
             phi[s] = phi_next
-            # novelty bonus for visiting a new tile
-            if alive_now[s] and novelty_w > 0:
+            # novelty bonus for new tiles + anti-camp penalty for being stuck.
+            if alive_now[s]:
                 cpos = (int(npl[1][s][0]), int(npl[1][s][1]))
                 if cpos not in visited[s]:
                     visited[s].add(cpos)
-                    r += novelty_w
+                    stale[s] = 0
+                    if novelty_w > 0:
+                        r += novelty_w
+                else:
+                    stale[s] += 1
+                    # only punish camping while genuinely trapped in a small pocket
+                    # (<25 tiles seen): forces it to bomb its way out, not nag it
+                    # late-game when it's fighting in an already-explored arena.
+                    if stale[s] > 12 and len(visited[s]) < 25:
+                        r += REWARD["camp"]
 
             nenc = encode_obs(nobs, s)
             traj[s].append((enc[s][0], enc[s][1], actions[s], r,
@@ -491,8 +532,8 @@ def train(
     lr=3e-4, gamma=0.99, n_step=3, batch_size=256, buffer_cap=100_000,
     target_freq=2000, eps_start=1.0, eps_end=0.05, eps_decay_episodes=8000,
     self_play_after=2000, snapshot_every=1000, pool_cap=10, learner_prob=0.6,
-    shaping_lam=0.1, novelty_w=0.01, per=True, alpha=0.6, beta0=0.4,
-    eval_every=1000, save_dir="ckpts", resume=None, warm_from=None,
+    shaping_lam=0.1, novelty_w=0.03, enemy_w=0.08, per=True, alpha=0.6, beta0=0.4,
+    eval_every=500, save_dir="ckpts", resume=None, warm_from=None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device} episodes={episodes} n_step={n_step} "
@@ -577,7 +618,7 @@ def train(
 
         traj, ranks = run_episode(env, seed + ep, q_net, learner_seats,
                                   opponents_map, epsilon, gamma, n_step,
-                                  shaping_lam, novelty_w)
+                                  shaping_lam, novelty_w, enemy_w)
 
         ep_rew, n_records = 0.0, 0
         for s in learner_seats:
@@ -702,9 +743,12 @@ def main():
                    help="prob each seat is the learner (rest = opponents). "
                         "1.0 = pure 4-seat self-play")
     p.add_argument("--shaping_lam", type=float, default=0.1, help="0 disables potential shaping")
-    p.add_argument("--novelty_w", type=float, default=0.01, help="0 disables novelty bonus")
+    p.add_argument("--novelty_w", type=float, default=0.03, help="0 disables novelty bonus")
+    p.add_argument("--enemy_w", type=float, default=0.08,
+                   help="enemy-seeking shaping weight (pull toward nearest live enemy; "
+                        "0 disables). Cures 'farms one corner, never advances'.")
     p.add_argument("--per", type=_b, default=True)
-    p.add_argument("--eval_every", type=int, default=1000)
+    p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--save_dir", default="ckpts")
     p.add_argument("--resume", default=None,
                    help="resume FULL state from a .pth checkpoint (model+optimizer+epsilon+step)")
@@ -722,7 +766,7 @@ def main():
         batch_size=args.batch_size, buffer_cap=args.buffer_cap,
         eps_decay_episodes=args.eps_decay_episodes, self_play_after=args.self_play_after,
         snapshot_every=args.snapshot_every, learner_prob=args.learner_prob,
-        shaping_lam=args.shaping_lam, novelty_w=args.novelty_w, per=args.per,
+        shaping_lam=args.shaping_lam, novelty_w=args.novelty_w, enemy_w=args.enemy_w, per=args.per,
         eval_every=args.eval_every, save_dir=args.save_dir, resume=args.resume,
         warm_from=args.warm_from, eps_start=args.eps_start, eps_end=args.eps_end,
     )
