@@ -569,8 +569,13 @@ def train(
         ck = torch.load(resume, map_location=device)
         net.load_state_dict(ck["model_state_dict"])
         optimizer.load_state_dict(ck["optimizer_state_dict"])
+        # optimizer.load_state_dict OVERWRITES lr with the value saved in the
+        # checkpoint, silently ignoring --lr. Re-apply the requested lr so a resume
+        # can fine-tune at a gentler step size (Adam moment estimates are kept).
+        for g in optimizer.param_groups:
+            g["lr"] = lr
         start_iter = int(ck.get("iter", 0))
-        print(f"[resume] {resume} @ iter{start_iter}")
+        print(f"[resume] {resume} @ iter{start_iter} lr={lr} (Adam state restored)")
     elif warm_from:
         if warm_from.endswith(".pt"):
             src = torch.jit.load(warm_from, map_location=device).state_dict()
