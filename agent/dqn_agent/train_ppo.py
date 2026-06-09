@@ -544,6 +544,7 @@ def train(
     self_play_after=50, snapshot_every=100, pool_cap=12, self_opp_prob=0.5,
     bc_pretrain=False, bc_games=300, bc_epochs=4, bc_lr=1e-3,
     eval_every=100, save_dir="ckpts_ppo", resume=None, warm_from=None,
+    opponent_ckpts=None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     total_epi = iters * epi_per_iter
@@ -612,6 +613,20 @@ def train(
     # ACTIVE opponent from iteration 0 (camping then yields ties, not free wins).
     if bc_pretrain or warm_from:
         pool.append(copy.deepcopy({k: v.cpu() for k, v in net.state_dict().items()}))
+    # Variant C: FIXED strong opponents (e.g. your own champion models). Loading
+    # them into the opponent set makes the policy train AGAINST real learned agents
+    # from iteration 0 -- not just rule bots + early-weak self snapshots -- so it
+    # learns to beat the kind of opponent it actually faces on the leaderboard.
+    fixed_opponents = []
+    if opponent_ckpts:
+        for cp in [s.strip() for s in opponent_ckpts.split(",") if s.strip()]:
+            if cp.endswith(".pt"):
+                sd = torch.jit.load(cp, map_location="cpu").state_dict()
+            else:
+                ck_o = torch.load(cp, map_location="cpu")
+                sd = ck_o.get("model_state_dict", ck_o)
+            fixed_opponents.append({k: v.cpu() for k, v in sd.items()})
+        print(f"[opponent_ckpts] loaded {len(fixed_opponents)} fixed champion opponent(s)")
     n_players = len(env.players)
     try:
         from tqdm import trange
@@ -633,10 +648,11 @@ def train(
                 if random.random() < learner_prob:
                     learner_seats.append(seat)
                 else:
-                    use_self = pool and it >= self_play_after and random.random() < self_opp_prob
+                    opp_candidates = pool + fixed_opponents
+                    use_self = opp_candidates and it >= self_play_after and random.random() < self_opp_prob
                     if use_self:
                         opponents_map[seat] = NetPPOPolicy(
-                            random.choice(pool), map_shape, aux_dim, seat)
+                            random.choice(opp_candidates), map_shape, aux_dim, seat)
                     else:
                         opponents_map[seat] = RULE_CLASSES[random.choice(STRONG_RULES)](seat)
             if not learner_seats:
@@ -788,6 +804,10 @@ def main():
     p.add_argument("--save_dir", default="ckpts_ppo")
     p.add_argument("--resume", default=None)
     p.add_argument("--warm_from", default=None)
+    p.add_argument("--opponent_ckpts", default=None,
+                   help="comma-separated .pth/.pt checkpoints to add as FIXED strong "
+                        "opponents in the self-play pool (Variant C: train vs your own "
+                        "champion models so it learns to beat real learned agents).")
     args = p.parse_args()
 
     seed_everything(args.seed)
@@ -804,6 +824,7 @@ def main():
         bc_games=args.bc_games, bc_epochs=args.bc_epochs, bc_lr=args.bc_lr,
         eval_every=args.eval_every, save_dir=args.save_dir,
         resume=args.resume, warm_from=args.warm_from,
+        opponent_ckpts=args.opponent_ckpts,
     )
 
 
