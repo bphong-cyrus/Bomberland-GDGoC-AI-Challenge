@@ -1,20 +1,25 @@
 """
 GDGoC-HCMUS AI Challenge 2026 — Bomberland submission agent.
 
-This is the ONLY file the evaluation server calls. It supports BOTH model types:
+This is the ONLY file the evaluation server calls. It supports THREE model types:
 
   * PPO actor-critic (model.pt whose forward returns a (logits, value) tuple) —
     picked with a light inference shield (see ppo.shielded_action). This is the
     aggressive, non-camping policy.
+  * RECURRENT (LSTM) PPO actor-critic (model.pt exposing a `step(map, aux, hidden)`
+    method) — driven with a maintained (h, c) hidden state across act() calls,
+    reset at game start; logits then go through the SAME shield. See ppo_lstm.py.
   * DQN dueling net (model.pt whose forward returns a single Q tensor) — picked
     with the full survivability safety mask (model.safe_action). Kept as a fallback.
 
-Detection is automatic: we just look at whether the network's output is a tuple.
+Detection is automatic: a recurrent net is detected by its `step` method; a PPO
+net by its tuple output; otherwise it is treated as a DQN.
 
 Flat submission zip should contain:
     agent.py        (this file)
     model.py        (shared encoder / danger model / DQN net / safety mask)
     ppo.py          (PPO actor-critic + inference shield)   [needed for a PPO model]
+    ppo_lstm.py     (recurrent PPO net + driver)            [needed for an LSTM model]
     model.pt        (TorchScript weights — preferred) or model.pth (checkpoint)
 """
 from pathlib import Path
@@ -31,6 +36,16 @@ except ImportError:                   # imported as a package (local dev)
                         N_MAP_CH, N_AUX, NUM_ACTIONS)
     from .ppo import PPOActorCritic, shielded_action
 
+# Recurrent (LSTM) net is OPTIONAL: only needed for an LSTM model.pt. A plain
+# feedforward submission zip need not ship ppo_lstm.py, so import defensively.
+try:
+    try:
+        from ppo_lstm import PPOLSTMActorCritic
+    except ImportError:
+        from .ppo_lstm import PPOLSTMActorCritic
+except ImportError:
+    PPOLSTMActorCritic = None
+
 torch.set_num_threads(1)              # match the single-threaded eval sandbox
 
 
@@ -42,6 +57,8 @@ class Agent:
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
         self.is_ppo = False
+        self.is_recurrent = False
+        self._hidden = None            # carried (h, c) for a recurrent policy
         base = Path(__file__).parent
 
         ts = base / "model.pt"
@@ -60,11 +77,24 @@ class Agent:
         self._detect_arch()
 
     def _detect_arch(self):
-        """Run one dummy forward to learn whether this is a PPO (tuple output) or
-        DQN (single tensor) network — so act() can dispatch correctly."""
+        """Learn whether this is a RECURRENT PPO (has a `step(map,aux,hidden)`
+        method), a feedforward PPO (tuple output), or a DQN (single tensor) — so
+        act() can dispatch correctly. The feedforward/DQN detection is UNCHANGED."""
+        dm = torch.zeros(1, N_MAP_CH, 13, 13)
+        da = torch.zeros(1, N_AUX)
+        # 1) recurrent? try the single-step recurrent signature.
         try:
-            dm = torch.zeros(1, N_MAP_CH, 13, 13)
-            da = torch.zeros(1, N_AUX)
+            if hasattr(self._net, "step"):
+                with torch.no_grad():
+                    out = self._net.step(dm, da, None)
+                if isinstance(out, (tuple, list)) and len(out) == 3:
+                    self.is_recurrent = True
+                    self.is_ppo = True
+                    return
+        except Exception:
+            self.is_recurrent = False
+        # 2) feedforward PPO (tuple) vs DQN (tensor) — original heuristic.
+        try:
             with torch.no_grad():
                 out = self._net(dm, da)
             self.is_ppo = isinstance(out, (tuple, list))
@@ -82,21 +112,50 @@ class Agent:
             raise ValueError(
                 f"checkpoint encoding ({map_shape[0]}ch/{aux_dim}aux) != current "
                 f"encoder ({N_MAP_CH}ch/{N_AUX}aux); retrain with this model.py")
-        if ck.get("arch") == "ppo_actor_critic":
+        if ck.get("arch") == "ppo_lstm_actor_critic":
+            if PPOLSTMActorCritic is None:
+                raise ImportError("ppo_lstm.py is required to load a recurrent model")
+            net = PPOLSTMActorCritic(map_shape, aux_dim, num_actions,
+                                     lstm_hidden=int(ck.get("lstm_hidden", 256)))
+        elif ck.get("arch") == "ppo_actor_critic":
             net = PPOActorCritic(map_shape, aux_dim, num_actions)
         else:
             net = DQNModel(map_shape, aux_dim, num_actions)
         net.load_state_dict(ck["model_state_dict"])
         return net
 
+    @staticmethod
+    def _is_game_start(obs) -> bool:
+        """Heuristic for the first step of a fresh game: NO bombs on the field AND
+        all players still alive. Robust whether the harness reuses or recreates the
+        Agent — used only by the recurrent path to reset its hidden state."""
+        try:
+            bombs = obs.get("bombs")
+            arr = np.asarray(bombs) if bombs is not None else np.zeros((0,))
+            n_bombs = 0 if arr.size == 0 else (1 if arr.ndim == 1 else arr.shape[0])
+            players = np.asarray(obs["players"])
+            all_alive = bool((players[:, 2] == 1).all())
+            return n_bombs == 0 and all_alive
+        except Exception:
+            return False
+
     def act(self, obs: dict) -> int:
         try:
             map_s, aux_s = encode_obs(obs, self.agent_id)
+            mt = torch.from_numpy(map_s).unsqueeze(0)
+            xt = torch.from_numpy(aux_s).unsqueeze(0)
+
+            if self.is_recurrent:
+                # reset hidden at game start (step-0-like obs); otherwise carry it.
+                if self._is_game_start(obs):
+                    self._hidden = None
+                with torch.no_grad():
+                    logits_t, _v, self._hidden = self._net.step(mt, xt, self._hidden)
+                logits = logits_t[0].numpy()
+                return int(shielded_action(obs, self.agent_id, logits))
+
             with torch.no_grad():
-                out = self._net(
-                    torch.from_numpy(map_s).unsqueeze(0),
-                    torch.from_numpy(aux_s).unsqueeze(0),
-                )
+                out = self._net(mt, xt)
             if self.is_ppo:
                 logits = out[0][0].numpy()
                 return int(shielded_action(obs, self.agent_id, logits))
@@ -115,7 +174,13 @@ if __name__ == "__main__":
         print("No weights found - train first with:  python -m agent.dqn_agent.train_ppo")
     else:
         agent = Agent(0)
-        print(f"loaded model: {'PPO actor-critic' if agent.is_ppo else 'DQN dueling'}")
+        if agent.is_recurrent:
+            kind = "PPO LSTM (recurrent)"
+        elif agent.is_ppo:
+            kind = "PPO actor-critic"
+        else:
+            kind = "DQN dueling"
+        print(f"loaded model: {kind}")
         rng = np.random.default_rng(0)
         obs = {
             "map": rng.integers(0, 3, size=(13, 13)).astype(np.int64),
