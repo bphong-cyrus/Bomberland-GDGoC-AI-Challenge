@@ -238,6 +238,10 @@ def ppo_update_seq(net, optimizer, episodes, cfg, device, ent_coef):
     Advantage normalisation is done GLOBALLY across all episodes (as in the
     feedforward trainer), then sliced per episode for the sequence forward.
     """
+    # cuDNN RNN backward only works if the forward ran in TRAIN mode (GPU-only
+    # error: "cudnn RNN backward can only be called in training mode"). The rollout
+    # phase leaves the net in eval(); switch to train() before the update forward.
+    net.train()
     # global advantage normalisation (match feedforward trainer's statistics)
     all_adv = np.concatenate([e["adv"] for e in episodes], axis=0)
     adv_mean = float(all_adv.mean())
