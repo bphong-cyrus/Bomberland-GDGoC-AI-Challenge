@@ -100,7 +100,14 @@ REWARD = {
                             #   game; anti-dawdle is handled by `camp` + `novelty`).
     "novelty":      0.02,   # first visit to a tile this episode (map coverage)
     "camp":        -0.05,   # stuck in a tiny already-explored pocket (anti-camp)
+    "idle_farmed": -0.03,   # farmed-out (few boxes left) but sitting still while enemies
+                            #   live -> the "doesn't know what to do after farming" bug.
 }
+
+# Boards with <= this many boxes left count as "farmed out" -> switch to HUNT (pull
+# hard toward enemies + penalise idling). This encodes the top-8 arc the agent missed:
+# farm boxes -> eat radius -> once nothing's left to farm, go kill people.
+FARMED_OUT_BOXES = 6
 
 
 # ── small utilities ──────────────────────────────────────────────────────────
@@ -160,10 +167,15 @@ def advance_potential(players, uid, lam_adv, center, dmax):
     return lam_adv * (1.0 - min(d, dmax) / dmax)
 
 
-def enemy_potential(players, uid, lam_e, dmax=20.0):
+def enemy_potential(players, uid, lam_e, grid=None, dmax=20.0):
     """Higher when CLOSER (Manhattan) to the nearest live enemy. Scaled up with the
     agent's power so a powered-up agent is pulled into the fight (farm early, fight
-    late) — but with a floor so even a weak agent still pressures opponents."""
+    late) — but with a floor so even a weak agent still pressures opponents.
+
+    If `grid` is given and the board is FARMED OUT (<= FARMED_OUT_BOXES boxes left),
+    the pull is boosted to full regardless of power: there is nothing left to farm, so
+    the only way to improve the rank is to hunt. This is the exact fix for the
+    'idles after farming' behaviour the user reported the model having."""
     if lam_e <= 0 or int(players[uid][2]) != 1:
         return 0.0
     sx, sy = int(players[uid][0]), int(players[uid][1])
@@ -176,13 +188,16 @@ def enemy_potential(players, uid, lam_e, dmax=20.0):
     # Lower floor than before (was 0.5 + 0.25*power): a radius-1 agent should FARM,
     # not charge a fight it cannot win. Pull ramps up sharply with power so a farmed-up
     # agent (radius 3-5) gets the full hunting pull -> "farm early, fight late".
-    scale = min(1.0, 0.2 + 0.3 * power)
+    scale = 0.2 + 0.3 * power
+    if grid is not None and int((np.asarray(grid) == BOX).sum()) <= FARMED_OUT_BOXES:
+        scale += 0.5                      # farmed out -> hunt hard regardless of power
+    scale = min(1.0, scale)
     return lam_e * scale * (1.0 - min(min(dists), dmax) / dmax)
 
 
-def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv):
+def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv, grid=None):
     return (advance_potential(players, uid, lam_adv, center, dmax_adv)
-            + enemy_potential(players, uid, lam_e))
+            + enemy_potential(players, uid, lam_e, grid=grid))
 
 
 def event_reward(prev_obs, obs, uid, prev_stats, stats,
@@ -293,7 +308,8 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
     prev_alive = [bool(env.players[i].alive) for i in range(n)]
     death_order = []
     phi = {s: total_potential(np.asarray(obs["players"]), s,
-                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv)
+                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv,
+                              grid=np.asarray(obs["map"]))
            for s in learner_seats}
     visited = {s: {(int(obs["players"][s][0]), int(obs["players"][s][1]))}
                for s in learner_seats}
@@ -358,7 +374,8 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
             phi_next = 0.0
             if alive_now[s] and not (terminated):
                 phi_next = total_potential(npl, s, cfg["lam_adv"], cfg["lam_e"],
-                                           center, dmax_adv)
+                                           center, dmax_adv,
+                                           grid=np.asarray(nobs["map"]))
             r += gamma * phi_next - phi[s]
             phi[s] = phi_next
             # novelty + anti-camp
@@ -372,6 +389,11 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
                     stale[s] += 1
                     if stale[s] > 12 and len(visited[s]) < 25:
                         r += REWARD["camp"]
+                    # farmed-out idle: nothing left to farm, enemies alive, but sitting
+                    # still -> the exact passivity to punish (pushes it to go hunt).
+                    elif stale[s] > 8 and len(survivors) > 1 \
+                            and int((np.asarray(nobs["map"]) == BOX).sum()) <= FARMED_OUT_BOXES:
+                        r += REWARD["idle_farmed"]
             # true terminal for GAE = died OR env terminated (NOT plain truncation)
             done_gae = 1.0 if (not alive_now[s] or terminated) else 0.0
             mi = step_info[s]
@@ -542,7 +564,7 @@ def train(
     lam_adv=0.05, lam_e=0.1, learner_prob=0.5, safe_mask=True,
     shield_horizon=DEFAULT_SHIELD_HORIZON,
     self_play_after=50, snapshot_every=100, pool_cap=12, self_opp_prob=0.5,
-    bc_pretrain=False, bc_games=300, bc_epochs=4, bc_lr=1e-3,
+    bc_pretrain=False, bc_games=300, bc_epochs=4, bc_lr=1e-3, bc_sources=None,
     eval_every=100, save_dir="ckpts_ppo", resume=None, warm_from=None,
     opponent_ckpts=None,
 ):
@@ -593,7 +615,7 @@ def train(
         from agent.dqn_agent.bc import bc_pretrain as _bc
         _bc(net, device, games=bc_games, epochs=bc_epochs, lr=bc_lr,
             max_steps=max_steps, seed0=seed + 999, gamma=gamma,
-            lam_adv=lam_adv, lam_e=lam_e)
+            lam_adv=lam_adv, lam_e=lam_e, sources=bc_sources)
 
     cfg = {"gamma": gamma, "lam": lam, "clip": clip, "epochs": epochs,
            "minibatch": minibatch, "vf_coef": vf_coef, "max_grad_norm": max_grad_norm,
@@ -800,6 +822,10 @@ def main():
     p.add_argument("--bc_games", type=int, default=300)
     p.add_argument("--bc_epochs", type=int, default=4)
     p.add_argument("--bc_lr", type=float, default=1e-3)
+    p.add_argument("--bc_sources", default=None,
+                   help="comma-separated rule names to clone for the BC prior "
+                        "(default genius-majority + 1 hunter, see bc.BC_SOURCES). "
+                        "e.g. 'genius,genius,hunter' for more hunting in the prior.")
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--save_dir", default="ckpts_ppo")
     p.add_argument("--resume", default=None)
@@ -822,6 +848,7 @@ def main():
         snapshot_every=args.snapshot_every, pool_cap=args.pool_cap,
         self_opp_prob=args.self_opp_prob, bc_pretrain=args.bc_pretrain,
         bc_games=args.bc_games, bc_epochs=args.bc_epochs, bc_lr=args.bc_lr,
+        bc_sources=(args.bc_sources.split(",") if args.bc_sources else None),
         eval_every=args.eval_every, save_dir=args.save_dir,
         resume=args.resume, warm_from=args.warm_from,
         opponent_ckpts=args.opponent_ckpts,

@@ -46,9 +46,13 @@ from agent.dqn_agent.train_ppo import (                                 # noqa: 
 from engine.game import BomberEnv                                       # noqa: E402
 
 
-# default cloning field: genius-heavy (the behaviour we want), with a couple of
-# other competent bots for state diversity. Each seat is sampled from this list.
-BC_SOURCES = ["genius", "genius", "genius", "box_farmer", "tactical"]
+# default cloning field: genius-MAJORITY (farm-then-survive, the base behaviour we
+# want) PLUS one HunterAgent so the prior also contains the coupled "approach enemy ->
+# bomb it -> flee" skill. Without a hunter in the clone set the policy only ever sees
+# farming frames and goes passive/idle once the board is farmed out (the reported bug);
+# the hunter injects the late-game kill behaviour. Still genius-majority so it stays
+# farm-biased early (reckless pure-hunter priors die ~step 100). Tune via --bc_sources.
+BC_SOURCES = ["genius", "genius", "genius", "hunter", "box_farmer", "tactical"]
 
 
 def collect(games, max_steps, seed0, gamma, lam_adv, lam_e, center, dmax_adv,
@@ -74,7 +78,8 @@ def collect(games, max_steps, seed0, gamma, lam_adv, lam_e, center, dmax_adv,
         prev_stats = {i: dict(env.players[i].stats) for i in range(n)}
         prev_alive = [True] * n
         phi = {i: total_potential(np.asarray(obs["players"]), i, lam_adv, lam_e,
-                                  center, dmax_adv) for i in range(n)}
+                                  center, dmax_adv, grid=np.asarray(obs["map"]))
+               for i in range(n)}
         visited = {i: {(int(obs["players"][i][0]), int(obs["players"][i][1]))}
                    for i in range(n)}
         stale = {i: 0 for i in range(n)}
@@ -107,7 +112,8 @@ def collect(games, max_steps, seed0, gamma, lam_adv, lam_e, center, dmax_adv,
                                  terminated, terminated and survivors == [i])
                 phi_next = 0.0
                 if alive_now[i] and not terminated:
-                    phi_next = total_potential(npl, i, lam_adv, lam_e, center, dmax_adv)
+                    phi_next = total_potential(npl, i, lam_adv, lam_e, center, dmax_adv,
+                                               grid=np.asarray(nobs["map"]))
                 r += gamma * phi_next - phi[i]
                 phi[i] = phi_next
                 if alive_now[i]:
