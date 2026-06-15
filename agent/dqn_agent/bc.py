@@ -78,8 +78,7 @@ def collect(games, max_steps, seed0, gamma, lam_adv, lam_e, center, dmax_adv,
         prev_stats = {i: dict(env.players[i].stats) for i in range(n)}
         prev_alive = [True] * n
         phi = {i: total_potential(np.asarray(obs["players"]), i, lam_adv, lam_e,
-                                  center, dmax_adv, grid=np.asarray(obs["map"]))
-               for i in range(n)}
+                                  center, dmax_adv) for i in range(n)}
         visited = {i: {(int(obs["players"][i][0]), int(obs["players"][i][1]))}
                    for i in range(n)}
         stale = {i: 0 for i in range(n)}
@@ -112,8 +111,7 @@ def collect(games, max_steps, seed0, gamma, lam_adv, lam_e, center, dmax_adv,
                                  terminated, terminated and survivors == [i])
                 phi_next = 0.0
                 if alive_now[i] and not terminated:
-                    phi_next = total_potential(npl, i, lam_adv, lam_e, center, dmax_adv,
-                                               grid=np.asarray(nobs["map"]))
+                    phi_next = total_potential(npl, i, lam_adv, lam_e, center, dmax_adv)
                 r += gamma * phi_next - phi[i]
                 phi[i] = phi_next
                 if alive_now[i]:

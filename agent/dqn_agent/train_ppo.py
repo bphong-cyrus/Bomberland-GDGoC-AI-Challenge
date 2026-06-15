@@ -92,7 +92,12 @@ REWARD = {
     "opp_died":     0.3,    # any opponent removed this step (your rank improves)
     "box":          0.5,    # box destroyed (opens the map + spawns items)
     "item":         1.0,    # item collected = more bombs / bigger blast = real power
-    "bomb_target":  0.10,   # placed a bomb whose blast threatens a box or enemy
+    "bomb_box":     0.10,   # placed a bomb whose blast reaches a BOX (farming)
+    "bomb_enemy":   0.20,   # placed a bomb whose blast reaches an ENEMY -- a safe-strike
+                            #   SETUP, DOUBLED when farmed-out (the late-game hunt). Rewards
+                            #   the OUTCOME (threatening a foe from wherever you stand) so
+                            #   PPO learns the survivable distance, NOT a proximity pull that
+                            #   just ran it onto the enemy's bomb (that died ~step 369).
     "bomb_waste":  -0.05,   # placed a bomb that threatens nothing (anti-spam)
     "escape":       0.05,   # left a tile that was about to explode
     "step":        -0.005,  # mild time pressure (was -0.01: over 500 steps that summed to
@@ -134,25 +139,28 @@ def _min_instant_at(instants, pos):
     return min(s) if s else None
 
 
-def _bomb_threatens_target(grid, players, agent_id, bx, by, radius):
-    """True if a cross blast from (bx,by) reaches a box or a live enemy."""
+def _bomb_hits(grid, players, agent_id, bx, by, radius):
+    """Return (hits_box, hits_enemy): does a cross blast from (bx,by) reach a BOX /
+    a live enemy? Walls block the ray; a box is counted then blocks further."""
     H, W = grid.shape
     enemies = {(int(players[p][0]), int(players[p][1]))
                for p in range(len(players))
                if p != agent_id and int(players[p][2]) == 1}
+    hits_box = hits_enemy = False
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         for r in range(1, radius + 1):
             nx, ny = bx + dx * r, by + dy * r
             if not (0 <= nx < H and 0 <= ny < W):
                 break
             if (nx, ny) in enemies:
-                return True
+                hits_enemy = True
             c = grid[nx, ny]
             if c == WALL:
                 break
             if c == BOX:
-                return True
-    return False
+                hits_box = True
+                break
+    return hits_box, hits_enemy
 
 
 # ── potential-based shaping: PULL OUTWARD, then toward enemies ───────────────
@@ -167,15 +175,16 @@ def advance_potential(players, uid, lam_adv, center, dmax):
     return lam_adv * (1.0 - min(d, dmax) / dmax)
 
 
-def enemy_potential(players, uid, lam_e, grid=None, dmax=20.0):
+def enemy_potential(players, uid, lam_e, dmax=20.0):
     """Higher when CLOSER (Manhattan) to the nearest live enemy. Scaled up with the
     agent's power so a powered-up agent is pulled into the fight (farm early, fight
     late) — but with a floor so even a weak agent still pressures opponents.
 
-    If `grid` is given and the board is FARMED OUT (<= FARMED_OUT_BOXES boxes left),
-    the pull is boosted to full regardless of power: there is nothing left to farm, so
-    the only way to improve the rank is to hunt. This is the exact fix for the
-    'idles after farming' behaviour the user reported the model having."""
+    This is a MILD positional pull only (kept at the proven low weight). The actual
+    hunt incentive lives in the OUTCOME reward `bomb_enemy` (see event_reward): a
+    strong farmed-out PROXIMITY boost was tried and it just ran the agent onto enemy
+    bombs and died (~step 369). Rewarding the bomb-on-enemy OUTCOME instead lets PPO
+    learn to strike from a survivable distance."""
     if lam_e <= 0 or int(players[uid][2]) != 1:
         return 0.0
     sx, sy = int(players[uid][0]), int(players[uid][1])
@@ -185,19 +194,13 @@ def enemy_potential(players, uid, lam_e, grid=None, dmax=20.0):
     if not dists:
         return 0.0
     power = int(players[uid][4])
-    # Lower floor than before (was 0.5 + 0.25*power): a radius-1 agent should FARM,
-    # not charge a fight it cannot win. Pull ramps up sharply with power so a farmed-up
-    # agent (radius 3-5) gets the full hunting pull -> "farm early, fight late".
-    scale = 0.2 + 0.3 * power
-    if grid is not None and int((np.asarray(grid) == BOX).sum()) <= FARMED_OUT_BOXES:
-        scale += 0.5                      # farmed out -> hunt hard regardless of power
-    scale = min(1.0, scale)
+    scale = min(1.0, 0.2 + 0.3 * power)
     return lam_e * scale * (1.0 - min(min(dists), dmax) / dmax)
 
 
-def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv, grid=None):
+def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv):
     return (advance_potential(players, uid, lam_adv, center, dmax_adv)
-            + enemy_potential(players, uid, lam_e, grid=grid))
+            + enemy_potential(players, uid, lam_e))
 
 
 def event_reward(prev_obs, obs, uid, prev_stats, stats,
@@ -220,8 +223,15 @@ def event_reward(prev_obs, obs, uid, prev_stats, stats,
     n_bomb = max(0, stats["bombs"] - prev_stats["bombs"])
     if n_bomb > 0:
         radius = 1 + int(pl_prev[uid][4])
-        if _bomb_threatens_target(grid, pl_prev, uid, px, py, radius):
-            r += REWARD["bomb_target"] * n_bomb
+        hits_box, hits_enemy = _bomb_hits(grid, pl_prev, uid, px, py, radius)
+        if hits_enemy:
+            # OUTCOME-based hunt reward, DOUBLED once farmed out (the late-game phase
+            # where it used to wander). PPO learns to do this from a survivable spot
+            # (death=-4 + the shield), not by rushing onto the enemy.
+            farmed_out = int((grid == BOX).sum()) <= FARMED_OUT_BOXES
+            r += REWARD["bomb_enemy"] * (2.0 if farmed_out else 1.0) * n_bomb
+        elif hits_box:
+            r += REWARD["bomb_box"] * n_bomb
         else:
             r += REWARD["bomb_waste"] * n_bomb
 
@@ -308,8 +318,7 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
     prev_alive = [bool(env.players[i].alive) for i in range(n)]
     death_order = []
     phi = {s: total_potential(np.asarray(obs["players"]), s,
-                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv,
-                              grid=np.asarray(obs["map"]))
+                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv)
            for s in learner_seats}
     visited = {s: {(int(obs["players"][s][0]), int(obs["players"][s][1]))}
                for s in learner_seats}
@@ -374,8 +383,7 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
             phi_next = 0.0
             if alive_now[s] and not (terminated):
                 phi_next = total_potential(npl, s, cfg["lam_adv"], cfg["lam_e"],
-                                           center, dmax_adv,
-                                           grid=np.asarray(nobs["map"]))
+                                           center, dmax_adv)
             r += gamma * phi_next - phi[s]
             phi[s] = phi_next
             # novelty + anti-camp
