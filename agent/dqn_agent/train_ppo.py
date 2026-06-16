@@ -114,6 +114,10 @@ REWARD = {
 # farm boxes -> eat radius -> once nothing's left to farm, go kill people.
 FARMED_OUT_BOXES = 6
 
+# Multiplier on the bomb_enemy reward once the board is farmed out (the late-game hunt
+# incentive). 1.0 = no late boost (~ proven, no extra hunting). Tunable via --hunt_boost.
+HUNT_BOOST = 2.0
+
 
 # ── small utilities ──────────────────────────────────────────────────────────
 def seed_everything(seed):
@@ -229,7 +233,7 @@ def event_reward(prev_obs, obs, uid, prev_stats, stats,
             # where it used to wander). PPO learns to do this from a survivable spot
             # (death=-4 + the shield), not by rushing onto the enemy.
             farmed_out = int((grid == BOX).sum()) <= FARMED_OUT_BOXES
-            r += REWARD["bomb_enemy"] * (2.0 if farmed_out else 1.0) * n_bomb
+            r += REWARD["bomb_enemy"] * (HUNT_BOOST if farmed_out else 1.0) * n_bomb
         elif hits_box:
             r += REWARD["bomb_box"] * n_bomb
         else:
@@ -573,10 +577,22 @@ def train(
     shield_horizon=DEFAULT_SHIELD_HORIZON,
     self_play_after=50, snapshot_every=100, pool_cap=12, self_opp_prob=0.5,
     bc_pretrain=False, bc_games=300, bc_epochs=4, bc_lr=1e-3, bc_sources=None,
+    bomb_enemy=None, bomb_box=None, idle_w=None, hunt_boost=None,
     eval_every=100, save_dir="ckpts_ppo", resume=None, warm_from=None,
     opponent_ckpts=None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    global HUNT_BOOST
+    if bomb_enemy is not None:
+        REWARD["bomb_enemy"] = float(bomb_enemy)
+    if bomb_box is not None:
+        REWARD["bomb_box"] = float(bomb_box)
+    if idle_w is not None:
+        REWARD["idle_farmed"] = -abs(float(idle_w))
+    if hunt_boost is not None:
+        HUNT_BOOST = float(hunt_boost)
+    print(f"[reward] bomb_enemy={REWARD['bomb_enemy']:.2f} bomb_box={REWARD['bomb_box']:.2f} "
+          f"idle_farmed={REWARD['idle_farmed']:.3f} hunt_boost={HUNT_BOOST:.1f} lam_e={lam_e}")
     total_epi = iters * epi_per_iter
     print(f"[ppo] device={device} iters={iters} epi/iter={epi_per_iter} "
           f"(~{total_epi} episodes) lr={lr} clip={clip} ent={ent_start}->{ent_end} "
@@ -834,6 +850,16 @@ def main():
                    help="comma-separated rule names to clone for the BC prior "
                         "(default genius-majority + 1 hunter, see bc.BC_SOURCES). "
                         "e.g. 'genius,genius,hunter' for more hunting in the prior.")
+    # reward knobs (None = keep defaults). For a PROVEN no-hunt run set
+    # --bomb_enemy 0.10 --idle_w 0 --hunt_boost 1.0 (matches the it6000 regime).
+    p.add_argument("--bomb_enemy", type=float, default=None,
+                   help="reward for a bomb whose blast reaches an ENEMY (default 0.20)")
+    p.add_argument("--bomb_box", type=float, default=None,
+                   help="reward for a bomb whose blast reaches a BOX (default 0.10)")
+    p.add_argument("--idle_w", type=float, default=None,
+                   help="magnitude of the farmed-out idle penalty (default 0.03; 0=off)")
+    p.add_argument("--hunt_boost", type=float, default=None,
+                   help="bomb_enemy multiplier when farmed-out (default 2.0; 1.0=off)")
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--save_dir", default="ckpts_ppo")
     p.add_argument("--resume", default=None)
@@ -857,6 +883,8 @@ def main():
         self_opp_prob=args.self_opp_prob, bc_pretrain=args.bc_pretrain,
         bc_games=args.bc_games, bc_epochs=args.bc_epochs, bc_lr=args.bc_lr,
         bc_sources=(args.bc_sources.split(",") if args.bc_sources else None),
+        bomb_enemy=args.bomb_enemy, bomb_box=args.bomb_box,
+        idle_w=args.idle_w, hunt_boost=args.hunt_boost,
         eval_every=args.eval_every, save_dir=args.save_dir,
         resume=args.resume, warm_from=args.warm_from,
         opponent_ckpts=args.opponent_ckpts,
