@@ -83,7 +83,7 @@ STRONG_RULES = ["hunter", "hunter", "hunter", "genius", "genius",
 
 # ── reward shaping (aligned with the match ranking) ──────────────────────────
 REWARD = {
-    "death":       -4.0,    # eliminated — by far the worst outcome (survival DOMINATES
+    "death":       -8.0,    # eliminated — by far the worst outcome (survival DOMINATES
                             #   the TrueSkill rank); bumped -3 -> -4 so the policy values
                             #   staying alive over a greedy farm that gets it cornered.
     "sole_winner":  5.0,    # last agent standing — the top of the ranking (draw_prob=0.1
@@ -112,11 +112,11 @@ REWARD = {
 # Boards with <= this many boxes left count as "farmed out" -> switch to HUNT (pull
 # hard toward enemies + penalise idling). This encodes the top-8 arc the agent missed:
 # farm boxes -> eat radius -> once nothing's left to farm, go kill people.
-FARMED_OUT_BOXES = 15
+FARMED_OUT_BOXES = 5
 
 # Multiplier on the bomb_enemy reward once the board is farmed out (the late-game hunt
 # incentive). 1.0 = no late boost (~ proven, no extra hunting). Tunable via --hunt_boost.
-HUNT_BOOST = 3.0
+HUNT_BOOST = 1.5
 
 
 # ── small utilities ──────────────────────────────────────────────────────────

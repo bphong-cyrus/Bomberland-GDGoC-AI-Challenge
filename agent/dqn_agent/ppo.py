@@ -46,7 +46,7 @@ GRASS, WALL, BOX, ITEM_RADIUS, ITEM_CAPACITY = 0, 1, 2, 3, 4
 # A MIDDLE horizon (~6) is the sweet spot: it stops the multi-step bomb traps that
 # were killing the BC-active policy, without the over-conservatism that caused
 # camping. Tunable from train_ppo via --shield_horizon.
-DEFAULT_SHIELD_HORIZON = 6
+DEFAULT_SHIELD_HORIZON = 8
 
 
 # ── Actor-Critic network (TorchScript-friendly; mirrors DQNModel's conv trunk) ──
