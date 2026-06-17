@@ -112,11 +112,11 @@ REWARD = {
 # Boards with <= this many boxes left count as "farmed out" -> switch to HUNT (pull
 # hard toward enemies + penalise idling). This encodes the top-8 arc the agent missed:
 # farm boxes -> eat radius -> once nothing's left to farm, go kill people.
-FARMED_OUT_BOXES = 6
+FARMED_OUT_BOXES = 15
 
 # Multiplier on the bomb_enemy reward once the board is farmed out (the late-game hunt
 # incentive). 1.0 = no late boost (~ proven, no extra hunting). Tunable via --hunt_boost.
-HUNT_BOOST = 2.0
+HUNT_BOOST = 3.0
 
 
 # ── small utilities ──────────────────────────────────────────────────────────
