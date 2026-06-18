@@ -32,9 +32,15 @@ import torch.nn as nn
 try:                                  # flat submission (sibling files on sys.path)
     from model import (encode_obs, compute_danger, ACTION_DELTA, NUM_ACTIONS,
                        N_MAP_CH, N_AUX, _walkable, _bombs_array, _survivable)
-except ImportError:                   # imported as a package (local dev / training)
-    from .model import (encode_obs, compute_danger, ACTION_DELTA, NUM_ACTIONS,
-                        N_MAP_CH, N_AUX, _walkable, _bombs_array, _survivable)
+except ImportError:
+    try:                              # imported as a package (local dev / training)
+        from .model import (encode_obs, compute_danger, ACTION_DELTA, NUM_ACTIONS,
+                            N_MAP_CH, N_AUX, _walkable, _bombs_array, _survivable)
+    except ImportError:               # flat but dir NOT on sys.path (grader precheck via
+        import os as _os, sys as _sys  # file-path import) -> add our own dir, retry absolute
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from model import (encode_obs, compute_danger, ACTION_DELTA, NUM_ACTIONS,
+                           N_MAP_CH, N_AUX, _walkable, _bombs_array, _survivable)
 
 GRASS, WALL, BOX, ITEM_RADIUS, ITEM_CAPACITY = 0, 1, 2, 3, 4
 

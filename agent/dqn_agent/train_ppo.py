@@ -66,6 +66,7 @@ from agent import (                              # noqa: E402
     RandomAgent, SimpleRuleAgent, SmarterRuleAgent,
     TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent, HunterAgent,
 )
+from agent.dqn_agent.smart_agent import SmartAgent   # noqa: E402  (search/heuristic bot)
 
 GRASS, WALL, BOX, ITEM_R, ITEM_C = 0, 1, 2, 3, 4
 
@@ -73,6 +74,10 @@ RULE_CLASSES = {
     "random": RandomAgent, "simple": SimpleRuleAgent, "smarter": SmarterRuleAgent,
     "tactical": TacticalRuleAgent, "genius": GeniusRuleAgent,
     "box_farmer": BoxFarmerAgent, "hunter": HunterAgent,
+    # The survival-first SEARCH bot (smart_agent.py): elite survival + active cornering.
+    # As a training opponent it punishes BOTH camping (it hunts) and reckless approaches
+    # (it corners you) -> novel diversity the rule-only pool lacked. Opt in via --tough_pool.
+    "smart": SmartAgent,
 }
 # Hunter-heavy: in 4-player FFA a learner can win cheaply by turtling while the
 # others fight and die. Only an opponent that actively HUNTS a camper makes
@@ -868,7 +873,16 @@ def main():
                    help="comma-separated .pth/.pt checkpoints to add as FIXED strong "
                         "opponents in the self-play pool (Variant C: train vs your own "
                         "champion models so it learns to beat real learned agents).")
+    p.add_argument("--tough_pool", type=_b, default=False,
+                   help="add the SEARCH bot (smart_agent) to the rule-opponent rotation "
+                        "so PPO learns to survive+fight a cornering opponent (novel "
+                        "diversity). NOTE: ~1.8ms/step makes episodes a bit slower.")
     args = p.parse_args()
+
+    if args.tough_pool and "smart" not in STRONG_RULES:
+        STRONG_RULES.append("smart")
+        print("[tough_pool] added 'smart' (search bot) to the opponent rotation:",
+              STRONG_RULES)
 
     seed_everything(args.seed)
     train(
