@@ -55,7 +55,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from agent.dqn_agent.model import (              # noqa: E402
-    encode_obs, compute_danger, NUM_ACTIONS,
+    encode_obs, compute_danger, NUM_ACTIONS, _blast_tiles, _walkable, BOX as _BOX,
 )
 from agent.dqn_agent.ppo import (                # noqa: E402
     PPOActorCritic, physical_action_mask, safe_action_mask, shielded_action,
@@ -207,9 +207,72 @@ def enemy_potential(players, uid, lam_e, dmax=20.0):
     return lam_e * scale * (1.0 - min(min(dists), dmax) / dmax)
 
 
-def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv):
-    return (advance_potential(players, uid, lam_adv, center, dmax_adv)
-            + enemy_potential(players, uid, lam_e))
+def _enemy_room(grid, ex, ey, danger, max_depth=8):
+    """Flood-fill count of walkable tiles a foe at (ex,ey) can reach in <=max_depth
+    steps, avoiding `danger` (bomb-blast tiles). Low == the foe is boxed in."""
+    q = [(ex, ey)]
+    seen = {(ex, ey)}
+    depth = {(ex, ey): 0}
+    head = n = 0
+    while head < len(q):
+        x, y = q[head]
+        head += 1
+        n += 1
+        if depth[(x, y)] >= max_depth:
+            continue
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            np_ = (x + dx, y + dy)
+            if np_ in seen or not _walkable(grid, np_[0], np_[1]) or np_ in danger:
+                continue
+            seen.add(np_)
+            depth[np_] = depth[(x, y)] + 1
+            q.append(np_)
+    return n
+
+
+def confine_potential(grid, players, uid, lam_pos, bombs):
+    """SAFE-cornering shaping (the one reward direction NOT yet shown to regress).
+
+    High when I am OUT of every enemy's current blast AND the nearest enemy is CONFINED
+    (small escape room). Potential-based, so it rewards MOVING/BOMBING toward confining a
+    foe WHILE STAYING SAFE -- the late-game positioning the net never learned -- without
+    the raw proximity pull that made past aggression rush onto bombs and die (~step 369).
+    Credit is ZERO whenever I'm exposed to a foe's blast, so it can't teach reckless
+    approaches. Active only late (powered OR farmed-out) so early farming is untouched.
+    Keep lam_pos SMALL (~0.05); gate hard before shipping."""
+    if lam_pos <= 0 or int(players[uid][2]) != 1:
+        return 0.0
+    npl = len(players)
+    enemies = [(int(players[p][0]), int(players[p][1]), 1 + int(players[p][4]))
+               for p in range(npl) if p != uid and int(players[p][2]) == 1]
+    if not enemies:
+        return 0.0
+    boxes_left = int((np.asarray(grid) == _BOX).sum())
+    if int(players[uid][4]) < 3 and boxes_left > FARMED_OUT_BOXES:
+        return 0.0                                   # still early -> just farm, no shaping
+    mx, my = int(players[uid][0]), int(players[uid][1])
+    for (ex, ey, er) in enemies:                     # exposed to ANY foe's blast -> no credit
+        if (mx, my) in set(_blast_tiles(grid, ex, ey, er)):
+            return 0.0
+    danger = set()                                   # foe confined by EXISTING bombs counts
+    for b in bombs:
+        bx, by, owner = int(b[0]), int(b[1]), int(b[3])
+        r = 1 + int(players[owner][4]) if 0 <= owner < npl else 2
+        danger.update(_blast_tiles(grid, bx, by, r))
+    nearest = min(enemies, key=lambda e: abs(e[0] - mx) + abs(e[1] - my))
+    room = _enemy_room(grid, nearest[0], nearest[1], danger)
+    MAXROOM = 20.0
+    return lam_pos * (1.0 - min(room, MAXROOM) / MAXROOM)
+
+
+def total_potential(players, uid, lam_adv, lam_e, center, dmax_adv,
+                    grid=None, bombs=None, lam_pos=0.0):
+    p = (advance_potential(players, uid, lam_adv, center, dmax_adv)
+         + enemy_potential(players, uid, lam_e))
+    if lam_pos > 0 and grid is not None:
+        p += confine_potential(grid, players, uid, lam_pos,
+                               bombs if bombs is not None else [])
+    return p
 
 
 def event_reward(prev_obs, obs, uid, prev_stats, stats,
@@ -327,7 +390,9 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
     prev_alive = [bool(env.players[i].alive) for i in range(n)]
     death_order = []
     phi = {s: total_potential(np.asarray(obs["players"]), s,
-                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv)
+                              cfg["lam_adv"], cfg["lam_e"], center, dmax_adv,
+                              grid=np.asarray(obs["map"]), bombs=_bombs(obs),
+                              lam_pos=cfg.get("lam_pos", 0.0))
            for s in learner_seats}
     visited = {s: {(int(obs["players"][s][0]), int(obs["players"][s][1]))}
                for s in learner_seats}
@@ -392,7 +457,10 @@ def run_episode(env, seed, net, device, learner_seats, opponents, cfg, center,
             phi_next = 0.0
             if alive_now[s] and not (terminated):
                 phi_next = total_potential(npl, s, cfg["lam_adv"], cfg["lam_e"],
-                                           center, dmax_adv)
+                                           center, dmax_adv,
+                                           grid=np.asarray(nobs["map"]),
+                                           bombs=_bombs(nobs),
+                                           lam_pos=cfg.get("lam_pos", 0.0))
             r += gamma * phi_next - phi[s]
             phi[s] = phi_next
             # novelty + anti-camp
@@ -578,7 +646,7 @@ def train(
     iters=1500, epi_per_iter=8, max_steps=500, seed=86,
     lr=2.5e-4, gamma=0.99, lam=0.95, clip=0.2, epochs=4, minibatch=1024,
     vf_coef=0.5, ent_start=0.03, ent_end=0.005, max_grad_norm=0.5,
-    lam_adv=0.05, lam_e=0.1, learner_prob=0.5, safe_mask=True,
+    lam_adv=0.05, lam_e=0.1, lam_pos=0.0, learner_prob=0.5, safe_mask=True,
     shield_horizon=DEFAULT_SHIELD_HORIZON,
     self_play_after=50, snapshot_every=100, pool_cap=12, self_opp_prob=0.5,
     bc_pretrain=False, bc_games=300, bc_epochs=4, bc_lr=1e-3, bc_sources=None,
@@ -648,7 +716,7 @@ def train(
 
     cfg = {"gamma": gamma, "lam": lam, "clip": clip, "epochs": epochs,
            "minibatch": minibatch, "vf_coef": vf_coef, "max_grad_norm": max_grad_norm,
-           "lam_adv": lam_adv, "lam_e": lam_e}
+           "lam_adv": lam_adv, "lam_e": lam_e, "lam_pos": lam_pos}
     # Bounded-horizon survivable shield during training, IDENTICAL to inference.
     # safe_action_mask falls back to the physical mask when genuinely trapped, so the
     # sampler never sees an all-False mask (which would NaN the log-softmax).
@@ -830,6 +898,10 @@ def main():
                         "just gets it killed. Raise only if it still camps.")
     p.add_argument("--lam_e", type=float, default=0.1,
                    help="enemy-seeking shaping weight (scaled up with power)")
+    p.add_argument("--lam_pos", type=float, default=0.0,
+                   help="SAFE-cornering shaping: reward confining the nearest foe WHILE "
+                        "out of its blast, late-game only (0=off; try ~0.05). The one "
+                        "reward direction not yet shown to regress -- gate hard.")
     p.add_argument("--learner_prob", type=float, default=0.5,
                    help="prob each seat is a learner (rest = league opponents)")
     p.add_argument("--safe_mask", type=_b, default=True,
@@ -890,7 +962,8 @@ def main():
         seed=args.seed, lr=args.lr, gamma=args.gamma, lam=args.lam, clip=args.clip,
         epochs=args.epochs, minibatch=args.minibatch, vf_coef=args.vf_coef,
         ent_start=args.ent_start, ent_end=args.ent_end, max_grad_norm=args.max_grad_norm,
-        lam_adv=args.lam_adv, lam_e=args.lam_e, learner_prob=args.learner_prob,
+        lam_adv=args.lam_adv, lam_e=args.lam_e, lam_pos=args.lam_pos,
+        learner_prob=args.learner_prob,
         safe_mask=args.safe_mask, shield_horizon=args.shield_horizon,
         self_play_after=args.self_play_after,
         snapshot_every=args.snapshot_every, pool_cap=args.pool_cap,
